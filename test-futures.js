@@ -47,11 +47,22 @@ async function check(label, fn) {
 }
 
 async function main() {
+  header("0. Environment");
+  const isTestnet = process.env.BINANCE_FUTURES_TESTNET === "true";
+  const envLabel = isTestnet ? "🧪 TESTNET (virtual money)" : "🔴 PRODUCTION (real money)";
+  console.log(`  Mode: ${envLabel}`);
+  console.log(`  Endpoint: ${isTestnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com"}`);
+  if (!isTestnet) {
+    console.log(`  ⚠️  Running against PROD — this is read-only smoke test, no orders placed`);
+  }
+
   header("1. API key presence");
-  const hasKey = Boolean(process.env.BINANCE_FUTURES_API_KEY);
-  const hasSecret = Boolean(process.env.BINANCE_FUTURES_API_SECRET_KEY);
-  console.log(`  ${hasKey ? "✅" : "❌"} BINANCE_FUTURES_API_KEY`);
-  console.log(`  ${hasSecret ? "✅" : "❌"} BINANCE_FUTURES_API_SECRET_KEY`);
+  const keyVar = isTestnet ? "BINANCE_FUTURES_TESTNET_API_KEY" : "BINANCE_FUTURES_API_KEY";
+  const secretVar = isTestnet ? "BINANCE_FUTURES_TESTNET_API_SECRET" : "BINANCE_FUTURES_API_SECRET_KEY";
+  const hasKey = Boolean(process.env[keyVar]);
+  const hasSecret = Boolean(process.env[secretVar]);
+  console.log(`  ${hasKey ? "✅" : "❌"} ${keyVar}`);
+  console.log(`  ${hasSecret ? "✅" : "❌"} ${secretVar}`);
   if (!hasKey || !hasSecret) {
     console.log("\n  ⚠️  Missing creds — aborting.");
     process.exit(1);

@@ -19,12 +19,18 @@ import crypto from "crypto";
 const FUTURES_BASE = process.env.BINANCE_FUTURES_BASE_URL || "https://fapi.binance.com";
 const FUTURES_TESTNET = "https://testnet.binancefuture.com";
 
+// Testnet uses a separate Binance account with its own API credentials.
+// Production keys won't authenticate against testnet endpoints and vice versa.
+const isTestnet = process.env.BINANCE_FUTURES_TESTNET === "true";
+
 const config = {
-  // Separate API keys for futures (isolation from spot keys)
-  apiKey: process.env.BINANCE_FUTURES_API_KEY,
-  secretKey: process.env.BINANCE_FUTURES_API_SECRET_KEY,
-  // Use testnet endpoint when BINANCE_FUTURES_TESTNET=true
-  baseUrl: process.env.BINANCE_FUTURES_TESTNET === "true" ? FUTURES_TESTNET : FUTURES_BASE,
+  apiKey: isTestnet
+    ? (process.env.BINANCE_FUTURES_TESTNET_API_KEY || process.env.BINANCE_FUTURES_API_KEY)
+    : process.env.BINANCE_FUTURES_API_KEY,
+  secretKey: isTestnet
+    ? (process.env.BINANCE_FUTURES_TESTNET_API_SECRET || process.env.BINANCE_FUTURES_API_SECRET_KEY)
+    : process.env.BINANCE_FUTURES_API_SECRET_KEY,
+  baseUrl: isTestnet ? FUTURES_TESTNET : FUTURES_BASE,
 };
 
 function sign(query) {
