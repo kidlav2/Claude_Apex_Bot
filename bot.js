@@ -11,9 +11,25 @@
 
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
-import crypto from "crypto";
 import { execSync } from "child_process";
 import { STRATEGY, evaluateEntry, buildRationale } from "./strategy.js";
+
+// Broker module is selected by env flag. Both modules export the same surface
+// so processSymbol() doesn't care which is loaded.
+const USE_FUTURES = process.env.BINANCE_FUTURES === "true";
+const broker = USE_FUTURES
+  ? await import("./binance-futures.js")
+  : await import("./binance-spot.js");
+const {
+  placeBinanceOrder,
+  placeOcoBracket,
+  getBalanceUSDT,
+  getSymbolFilters,
+  initSymbol,
+  getOpenPositions,
+  cleanupOrphanedOrders,
+  checkFundingRate,
+} = broker;
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -140,125 +156,6 @@ function checkTradeLimits(log) {
   );
 
   return true;
-}
-
-// ─── Binance Execution ───────────────────────────────────────────────────────
-
-function signBinance(query) {
-  return crypto
-    .createHmac("sha256", CONFIG.binance.secretKey)
-    .update(query)
-    .digest("hex");
-}
-
-async function placeBinanceOrder(symbol, side, sizeUSD) {
-  const params = new URLSearchParams({
-    symbol,
-    side: side.toUpperCase(),
-    type: "MARKET",
-    quoteOrderQty: sizeUSD.toFixed(2),
-    timestamp: Date.now().toString(),
-    recvWindow: "5000",
-  });
-  params.append("signature", signBinance(params.toString()));
-
-  const res = await fetch(
-    `${CONFIG.binance.baseUrl}/api/v3/order?${params.toString()}`,
-    {
-      method: "POST",
-      headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey },
-    },
-  );
-
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Binance order failed: ${data.msg || res.status}`);
-  }
-  return { orderId: String(data.orderId), raw: data };
-}
-
-async function getBalanceUSDT() {
-  if (!CONFIG.binance.apiKey || !CONFIG.binance.secretKey) return null;
-  const params = new URLSearchParams({
-    timestamp: Date.now().toString(),
-    recvWindow: "5000",
-  });
-  params.append("signature", signBinance(params.toString()));
-  const res = await fetch(
-    `${CONFIG.binance.baseUrl}/api/v3/account?${params.toString()}`,
-    { headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey } },
-  );
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Account fetch failed: ${data.msg || res.status}`);
-  }
-  const usdt = data.balances.find((b) => b.asset === "USDT");
-  return usdt ? parseFloat(usdt.free) : 0;
-}
-
-async function getSymbolFilters(symbol) {
-  const res = await fetch(
-    `${CONFIG.binance.baseUrl}/api/v3/exchangeInfo?symbol=${symbol}`,
-  );
-  const data = await res.json();
-  if (!res.ok || !data.symbols?.[0]) {
-    throw new Error(`exchangeInfo failed for ${symbol}: ${data.msg || res.status}`);
-  }
-  const info = data.symbols[0];
-  const lotSize = info.filters.find((f) => f.filterType === "LOT_SIZE");
-  const priceFilter = info.filters.find((f) => f.filterType === "PRICE_FILTER");
-  return {
-    stepSize: parseFloat(lotSize.stepSize),
-    minQty: parseFloat(lotSize.minQty),
-    tickSize: parseFloat(priceFilter.tickSize),
-    minPrice: parseFloat(priceFilter.minPrice),
-  };
-}
-
-function formatStep(value, step) {
-  const decimals = (step.toString().split(".")[1] || "").length;
-  const rounded = Math.floor(value / step) * step;
-  return rounded.toFixed(decimals);
-}
-
-function buildOcoParams({ symbol, side, quantity, takeProfit, stopLoss, filters }) {
-  // For long entry (buy), exit OCO is SELL with TP above and SL below
-  // For short entry (sell), exit OCO is BUY with TP below and SL above
-  const ocoSide = side === "buy" ? "SELL" : "BUY";
-  const stopLimitOffset = 0.005; // 0.5% buffer for stop-limit price
-  const stopLimitPrice = side === "buy"
-    ? stopLoss * (1 - stopLimitOffset)
-    : stopLoss * (1 + stopLimitOffset);
-  return {
-    symbol,
-    side: ocoSide,
-    quantity: formatStep(quantity, filters.stepSize),
-    price: formatStep(takeProfit, filters.tickSize),
-    stopPrice: formatStep(stopLoss, filters.tickSize),
-    stopLimitPrice: formatStep(stopLimitPrice, filters.tickSize),
-    stopLimitTimeInForce: "GTC",
-  };
-}
-
-async function placeOcoOrder(ocoParams) {
-  const params = new URLSearchParams({
-    ...ocoParams,
-    timestamp: Date.now().toString(),
-    recvWindow: "5000",
-  });
-  params.append("signature", signBinance(params.toString()));
-  const res = await fetch(
-    `${CONFIG.binance.baseUrl}/api/v3/order/oco?${params.toString()}`,
-    {
-      method: "POST",
-      headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey },
-    },
-  );
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`OCO failed: ${data.msg || res.status}`);
-  }
-  return { orderListId: String(data.orderListId), raw: data };
 }
 
 // ─── Trading Journal ─────────────────────────────────────────────────────────
@@ -567,12 +464,25 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function processSymbol(symbol, timeframe, log) {
   console.log("\n═══════════════════════════════════════════════════════════");
-  console.log(`  ▶ ${symbol} | ${timeframe}`);
+  console.log(`  ▶ ${symbol} | ${timeframe} | ${USE_FUTURES ? "FUTURES" : "SPOT"}`);
   console.log("═══════════════════════════════════════════════════════════");
 
   if (countTodaysTrades(log) >= CONFIG.maxTradesPerDay) {
     console.log(`🚫 Daily trade limit reached — skipping ${symbol}`);
     return;
+  }
+
+  // Futures-only: clean up orphaned SL/TP orders left after a previous fill
+  // happened between bot runs. No-op on spot (atomic OCO handles itself).
+  if (USE_FUTURES && !CONFIG.paperTrading) {
+    try {
+      const cleanup = await cleanupOrphanedOrders(symbol);
+      if (cleanup.cancelled > 0) {
+        console.log(`🧹 Cancelled ${cleanup.cancelled} orphaned reduceOnly order(s)`);
+      }
+    } catch (err) {
+      console.log(`⚠️  Orphan cleanup failed: ${err.message}`);
+    }
   }
 
   console.log("\n── Fetching market data from Binance ───────────────────\n");
@@ -621,14 +531,44 @@ async function processSymbol(symbol, timeframe, log) {
 
   // Pre-trade gate 3: spot mode cannot execute SHORT — base asset not held.
   // SHORT setups require futures account; on spot they are blocked at entry.
-  const spotLongOnly = process.env.BINANCE_FUTURES !== "true";
-  if (spotLongOnly && side === "sell") {
+  if (!USE_FUTURES && side === "sell") {
     conditions.push({
       pass: false,
       label: "Spot mode supports LONG only",
       required: "side=buy (long) for spot account",
       actual: "side=sell (short) — requires futures",
     });
+  }
+
+  // Futures-only gates: anti-overlap (no doubling on same symbol) + funding rate
+  if (USE_FUTURES && !CONFIG.paperTrading) {
+    try {
+      const positions = await getOpenPositions(symbol);
+      const hasPosition = positions.some((p) => p.symbol === symbol);
+      conditions.push({
+        pass: !hasPosition,
+        label: "No existing futures position on symbol",
+        required: "0 open positions",
+        actual: hasPosition
+          ? `${positions[0].positionAmt > 0 ? "LONG" : "SHORT"} ${Math.abs(positions[0].positionAmt)} @ $${positions[0].entryPrice}`
+          : "none",
+      });
+    } catch (err) {
+      console.log(`⚠️  Position check failed: ${err.message}`);
+    }
+    try {
+      const funding = await checkFundingRate(symbol);
+      const skipThreshold = parseFloat(process.env.SKIP_HIGH_FUNDING_RATE || "0.001");
+      const fundingOk = Math.abs(funding.fundingRate) <= skipThreshold;
+      conditions.push({
+        pass: fundingOk,
+        label: "Funding rate within tolerance",
+        required: `|funding| <= ${(skipThreshold * 100).toFixed(2)}% per 8h`,
+        actual: `${(funding.fundingRate * 100).toFixed(4)}% per 8h`,
+      });
+    } catch (err) {
+      console.log(`⚠️  Funding rate check failed: ${err.message}`);
+    }
   }
 
   const allPass = conditions.every((c) => c.pass);
@@ -651,9 +591,17 @@ async function processSymbol(symbol, timeframe, log) {
     const spotShort = conditions.find(
       (c) => c.label === "Spot mode supports LONG only" && !c.pass,
     );
+    const overlap = conditions.find(
+      (c) => c.label === "No existing futures position on symbol" && !c.pass,
+    );
+    const funding = conditions.find(
+      (c) => c.label === "Funding rate within tolerance" && !c.pass,
+    );
     if (insufficient) blockReason = "INSUFFICIENT_FUNDS";
     else if (dup) blockReason = "DEDUP";
     else if (spotShort) blockReason = "SPOT_NO_SHORT";
+    else if (overlap) blockReason = "POSITION_OVERLAP";
+    else if (funding) blockReason = "HIGH_FUNDING";
     else blockReason = "STRATEGY";
   }
 
@@ -694,56 +642,45 @@ async function processSymbol(symbol, timeframe, log) {
     console.log(`✅ ALL CONDITIONS MET — ${side?.toUpperCase()} setup`);
     console.log(`   Stop: $${stopLoss?.toFixed(2)}  Target: $${takeProfit?.toFixed(2)}`);
 
-    // Build OCO params (works in both paper and live — needs symbol filters)
-    let ocoParams = null;
-    try {
-      const filters = await getSymbolFilters(symbol);
-      ocoParams = buildOcoParams({
-        symbol,
-        side,
-        quantity: tradeSize / price,
-        takeProfit,
-        stopLoss,
-        filters,
-      });
-    } catch (err) {
-      console.log(`⚠️  Could not build OCO params: ${err.message}`);
-      logEntry.oco = { placed: false, error: err.message };
-    }
-
     if (CONFIG.paperTrading) {
       console.log(
         `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+      console.log(`   Would OCO: TP=$${takeProfit?.toFixed(2)}, SL=$${stopLoss?.toFixed(2)}`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
-      if (ocoParams) {
-        console.log(`📋 OCO would be sent:`);
-        console.log(`   side=${ocoParams.side} qty=${ocoParams.quantity}`);
-        console.log(`   TP limit=${ocoParams.price} | SL stop=${ocoParams.stopPrice} → limit=${ocoParams.stopLimitPrice}`);
-        logEntry.oco = { placed: false, paper: true, params: ocoParams };
-      }
+      logEntry.oco = { placed: false, paper: true, takeProfit, stopLoss };
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side?.toUpperCase()} ${symbol}`,
+        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side?.toUpperCase()} ${symbol} (${USE_FUTURES ? "FUTURES" : "SPOT"})`,
       );
       try {
         const order = await placeBinanceOrder(symbol, side, tradeSize);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        const filledQty = order.executedQty || tradeSize / price;
+        console.log(`✅ ORDER PLACED — ${order.orderId} (qty=${filledQty})`);
 
-        // Place OCO immediately after fill
-        if (ocoParams) {
-          try {
-            const oco = await placeOcoOrder(ocoParams);
-            logEntry.oco = { placed: true, orderListId: oco.orderListId, params: ocoParams };
+        // Place OCO bracket immediately after fill — works for both spot
+        // (atomic) and futures (split into TP_MARKET + STOP_MARKET).
+        try {
+          const oco = await placeOcoBracket({
+            symbol,
+            entrySide: side,
+            quantity: filledQty,
+            takeProfit,
+            stopLoss,
+          });
+          logEntry.oco = { placed: true, ...oco };
+          if (oco.orderListId) {
             console.log(`✅ OCO PLACED — list ${oco.orderListId}`);
-          } catch (ocoErr) {
-            logEntry.oco = { placed: false, error: ocoErr.message, params: ocoParams };
-            console.log(`❌ OCO FAILED — ${ocoErr.message}`);
+          } else {
+            console.log(`✅ BRACKET PLACED — TP=${oco.tpOrderId} SL=${oco.slOrderId}`);
           }
+        } catch (ocoErr) {
+          logEntry.oco = { placed: false, error: ocoErr.message };
+          console.log(`❌ OCO FAILED — ${ocoErr.message}`);
         }
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
@@ -771,7 +708,7 @@ async function run() {
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
   console.log(
-    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
+    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Broker: ${USE_FUTURES ? "FUTURES (1×)" : "SPOT"}`,
   );
   console.log("═══════════════════════════════════════════════════════════");
 
@@ -783,6 +720,22 @@ async function run() {
 
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Watchlist: ${watchlist.join(", ")} | Timeframe: ${timeframe}`);
+
+  // Futures-only: idempotent setup of leverage + margin type per symbol.
+  // Spot's initSymbol is a no-op so this is safe to call unconditionally.
+  if (USE_FUTURES && !CONFIG.paperTrading) {
+    const leverage = parseInt(process.env.LEVERAGE || "1", 10);
+    const marginType = process.env.MARGIN_TYPE || "ISOLATED";
+    console.log(`\nFutures init: leverage=${leverage}× marginType=${marginType}`);
+    for (const symbol of watchlist) {
+      try {
+        await initSymbol(symbol, leverage, marginType);
+        console.log(`  ✅ ${symbol} configured`);
+      } catch (err) {
+        console.log(`  ⚠️  ${symbol} init failed: ${err.message}`);
+      }
+    }
+  }
 
   const log = loadLog();
   const withinLimits = checkTradeLimits(log);
