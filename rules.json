@@ -1,50 +1,61 @@
 {
-  "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
+  "watchlist": ["SOLUSDT", "ETHUSDT"],
+  "default_timeframe": "15m",
 
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "name": "ICT Silver Bullet",
+    "sources": ["The Inner Circle Trader (ICT)"],
+    "description": "Time-based intraday strategy. Three 1-hour kill zones in New York time. Inside each window, take entries in the direction of the higher-timeframe bias when a Fair Value Gap (FVG) forms aligned with that bias."
+  },
+
+  "kill_zones_ny_time": {
+    "London": "03:00 – 04:00",
+    "AM": "10:00 – 11:00",
+    "PM": "14:00 – 15:00"
   },
 
   "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "htf_ema50_1h": "Higher-timeframe bias. Price above EMA(50) on 1H = long bias. Below = short bias.",
+    "fair_value_gap": "Three-bar inefficiency. Bullish FVG: candle[2].low > candle[0].high. Bearish FVG: candle[2].high < candle[0].low. Look for FVG aligned with HTF bias inside the active kill zone.",
+    "kill_zone_clock": "Trade only when the current NY hour is one of 03, 10, or 14.",
+    "liquidity_sweep": "Wick that pierces the previous day's high/low and closes back inside. Long bias requires a sweep BELOW PDL (bears trapped). Short bias requires a sweep ABOVE PDH (bulls trapped). Lookback covers current + previous session (~48h on 15m)."
   },
 
   "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
+    "long": ["Price is above 1H EMA(50)"],
+    "short": ["Price is below 1H EMA(50)"]
   },
 
   "entry_rules": {
     "long": [
-      "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
+      "Active kill zone (London / AM / PM in NY time)",
+      "HTF bias is long — price above 1H EMA(50)",
+      "Recent bullish FVG within the last 20 bars on the entry timeframe",
+      "Price not more than 1.5% away from 1H EMA(50)",
+      "Liquidity sweep below PDL within current or previous session"
     ],
     "short": [
-      "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
-      "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
+      "Active kill zone (London / AM / PM in NY time)",
+      "HTF bias is short — price below 1H EMA(50)",
+      "Recent bearish FVG within the last 20 bars on the entry timeframe",
+      "Price not more than 1.5% away from 1H EMA(50)",
+      "Liquidity sweep above PDH within current or previous session"
     ]
   },
 
   "exit_rules": [
-    "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
-    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts",
-    "Take profit at next VWAP touch or EMA(8) cross"
+    "Stop-loss: opposite edge of the FVG that triggered entry (FVG bottom for longs, FVG top for shorts)",
+    "Take-profit: 2R — twice the distance from entry to stop-loss",
+    "Hard time stop: close any open position at the end of its kill zone window"
   ],
 
   "risk_rules": [
     "Risk maximum 1% of portfolio per trade",
     "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
     "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
+    "Do not trade outside the three NY kill zones",
+    "Paper trade first — validate on your specific asset before going live"
   ],
 
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+  "notes": "ICT Silver Bullet is a time-of-day strategy. Recommended entry timeframe: 5m to 15m. HTF bias filter is fixed at 1H EMA(50)."
 }

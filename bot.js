@@ -3,7 +3,7 @@
  *
  * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
  * Binance (free, no auth), calculates all indicators, runs safety check,
- * executes via BitGet if everything lines up.
+ * executes via Binance if everything lines up.
  *
  * Local mode: run manually — node bot.js
  * Cloud mode: deploy to Railway, set env vars, Railway triggers on cron schedule
@@ -13,11 +13,12 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import { STRATEGY, evaluateEntry, buildRationale } from "./strategy.js";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
+  const required = ["BINANCE_API_KEY", "BINANCE_SECRET_KEY"];
   const missing = required.filter((k) => !process.env[k]);
 
   if (!existsSync(".env")) {
@@ -27,10 +28,9 @@ function checkOnboarding() {
     writeFileSync(
       ".env",
       [
-        "# BitGet credentials",
-        "BITGET_API_KEY=",
-        "BITGET_SECRET_KEY=",
-        "BITGET_PASSPHRASE=",
+        "# Binance credentials (spot)",
+        "BINANCE_API_KEY=",
+        "BINANCE_SECRET_KEY=",
         "",
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
@@ -38,14 +38,14 @@ function checkOnboarding() {
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
-        "TIMEFRAME=4H",
+        "TIMEFRAME=15m",
       ].join("\n") + "\n",
     );
     try {
       execSync("open .env");
     } catch {}
     console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
+      "Fill in your Binance credentials in .env then re-run: node bot.js\n",
     );
     process.exit(0);
   }
@@ -73,17 +73,15 @@ function checkOnboarding() {
 
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
-  timeframe: process.env.TIMEFRAME || "4H",
+  timeframe: process.env.TIMEFRAME || "15m",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
-  tradeMode: process.env.TRADE_MODE || "spot",
-  bitget: {
-    apiKey: process.env.BITGET_API_KEY,
-    secretKey: process.env.BITGET_SECRET_KEY,
-    passphrase: process.env.BITGET_PASSPHRASE,
-    baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  binance: {
+    apiKey: process.env.BINANCE_API_KEY,
+    secretKey: process.env.BINANCE_SECRET_KEY,
+    baseUrl: process.env.BINANCE_BASE_URL || "https://api.binance.com",
   },
 };
 
@@ -105,177 +103,6 @@ function countTodaysTrades(log) {
   return log.trades.filter(
     (t) => t.timestamp.startsWith(today) && t.orderPlaced,
   ).length;
-}
-
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
-
-async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
-  const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
-  };
-  const binanceInterval = intervalMap[interval] || "1m";
-
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
-  const data = await res.json();
-
-  return data.map((k) => ({
-    time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
-}
-
-// ─── Indicator Calculations ──────────────────────────────────────────────────
-
-function calcEMA(closes, period) {
-  const multiplier = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < closes.length; i++) {
-    ema = closes[i] * multiplier + ema * (1 - multiplier);
-  }
-  return ema;
-}
-
-function calcRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
-}
-
-// VWAP — session-based, resets at midnight UTC
-function calcVWAP(candles) {
-  const midnightUTC = new Date();
-  midnightUTC.setUTCHours(0, 0, 0, 0);
-  const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
-  if (sessionCandles.length === 0) return null;
-  const cumTPV = sessionCandles.reduce(
-    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
-    0,
-  );
-  const cumVol = sessionCandles.reduce((sum, c) => sum + c.volume, 0);
-  return cumVol === 0 ? null : cumTPV / cumVol;
-}
-
-// ─── Safety Check ───────────────────────────────────────────────────────────
-
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
-  const results = [];
-
-  const check = (label, required, actual, pass) => {
-    results.push({ label, required, actual, pass });
-    const icon = pass ? "✅" : "🚫";
-    console.log(`  ${icon} ${label}`);
-    console.log(`     Required: ${required} | Actual: ${actual}`);
-  };
-
-  console.log("\n── Safety Check ─────────────────────────────────────────\n");
-
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
-
-  if (bullishBias) {
-    console.log("  Bias: BULLISH — checking long entry conditions\n");
-
-    // 1. Price above VWAP
-    check(
-      "Price above VWAP (buyers in control)",
-      `> ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price > vwap,
-    );
-
-    // 2. Price above EMA(8)
-    check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price > ema8,
-    );
-
-    // 3. RSI(3) pullback
-    check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
-    );
-
-    // 4. Not overextended from VWAP
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else if (bearishBias) {
-    console.log("  Bias: BEARISH — checking short entry conditions\n");
-
-    check(
-      "Price below VWAP (sellers in control)",
-      `< ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price < vwap,
-    );
-
-    check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price < ema8,
-    );
-
-    check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
-    );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
-    results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
-      pass: false,
-    });
-  }
-
-  const allPass = results.every((r) => r.pass);
-  return { results, allPass };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -315,56 +142,278 @@ function checkTradeLimits(log) {
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── Binance Execution ───────────────────────────────────────────────────────
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
+function signBinance(query) {
   return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+    .createHmac("sha256", CONFIG.binance.secretKey)
+    .update(query)
+    .digest("hex");
 }
 
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
-
-  const body = JSON.stringify({
+async function placeBinanceOrder(symbol, side, sizeUSD) {
+  const params = new URLSearchParams({
     symbol,
-    side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
+    side: side.toUpperCase(),
+    type: "MARKET",
+    quoteOrderQty: sizeUSD.toFixed(2),
+    timestamp: Date.now().toString(),
+    recvWindow: "5000",
   });
+  params.append("signature", signBinance(params.toString()));
 
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+  const res = await fetch(
+    `${CONFIG.binance.baseUrl}/api/v3/order?${params.toString()}`,
+    {
+      method: "POST",
+      headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey },
     },
-    body,
-  });
+  );
 
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+  if (!res.ok) {
+    throw new Error(`Binance order failed: ${data.msg || res.status}`);
+  }
+  return { orderId: String(data.orderId), raw: data };
+}
+
+async function getBalanceUSDT() {
+  if (!CONFIG.binance.apiKey || !CONFIG.binance.secretKey) return null;
+  const params = new URLSearchParams({
+    timestamp: Date.now().toString(),
+    recvWindow: "5000",
+  });
+  params.append("signature", signBinance(params.toString()));
+  const res = await fetch(
+    `${CONFIG.binance.baseUrl}/api/v3/account?${params.toString()}`,
+    { headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey } },
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Account fetch failed: ${data.msg || res.status}`);
+  }
+  const usdt = data.balances.find((b) => b.asset === "USDT");
+  return usdt ? parseFloat(usdt.free) : 0;
+}
+
+async function getSymbolFilters(symbol) {
+  const res = await fetch(
+    `${CONFIG.binance.baseUrl}/api/v3/exchangeInfo?symbol=${symbol}`,
+  );
+  const data = await res.json();
+  if (!res.ok || !data.symbols?.[0]) {
+    throw new Error(`exchangeInfo failed for ${symbol}: ${data.msg || res.status}`);
+  }
+  const info = data.symbols[0];
+  const lotSize = info.filters.find((f) => f.filterType === "LOT_SIZE");
+  const priceFilter = info.filters.find((f) => f.filterType === "PRICE_FILTER");
+  return {
+    stepSize: parseFloat(lotSize.stepSize),
+    minQty: parseFloat(lotSize.minQty),
+    tickSize: parseFloat(priceFilter.tickSize),
+    minPrice: parseFloat(priceFilter.minPrice),
+  };
+}
+
+function formatStep(value, step) {
+  const decimals = (step.toString().split(".")[1] || "").length;
+  const rounded = Math.floor(value / step) * step;
+  return rounded.toFixed(decimals);
+}
+
+function buildOcoParams({ symbol, side, quantity, takeProfit, stopLoss, filters }) {
+  // For long entry (buy), exit OCO is SELL with TP above and SL below
+  // For short entry (sell), exit OCO is BUY with TP below and SL above
+  const ocoSide = side === "buy" ? "SELL" : "BUY";
+  const stopLimitOffset = 0.005; // 0.5% buffer for stop-limit price
+  const stopLimitPrice = side === "buy"
+    ? stopLoss * (1 - stopLimitOffset)
+    : stopLoss * (1 + stopLimitOffset);
+  return {
+    symbol,
+    side: ocoSide,
+    quantity: formatStep(quantity, filters.stepSize),
+    price: formatStep(takeProfit, filters.tickSize),
+    stopPrice: formatStep(stopLoss, filters.tickSize),
+    stopLimitPrice: formatStep(stopLimitPrice, filters.tickSize),
+    stopLimitTimeInForce: "GTC",
+  };
+}
+
+async function placeOcoOrder(ocoParams) {
+  const params = new URLSearchParams({
+    ...ocoParams,
+    timestamp: Date.now().toString(),
+    recvWindow: "5000",
+  });
+  params.append("signature", signBinance(params.toString()));
+  const res = await fetch(
+    `${CONFIG.binance.baseUrl}/api/v3/order/oco?${params.toString()}`,
+    {
+      method: "POST",
+      headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey },
+    },
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`OCO failed: ${data.msg || res.status}`);
+  }
+  return { orderListId: String(data.orderListId), raw: data };
+}
+
+// ─── Trading Journal ─────────────────────────────────────────────────────────
+
+const JOURNAL_FILE = "trading_journal.md";
+
+function writeJournalEntry(logEntry, rationale) {
+  const now = new Date(logEntry.timestamp);
+  const dateStr = now.toISOString().slice(0, 10);
+  const timeStr = now.toISOString().slice(11, 19) + " UTC";
+
+  let tradeType = "—";
+  let status = "";
+  if (logEntry.allPass) {
+    tradeType = logEntry.side === "buy" ? "Long" : "Short";
+    if (logEntry.paperTrading) status = "PAPER";
+    else if (logEntry.orderPlaced) status = "LIVE ✅";
+    else status = `ОШИБКА: ${logEntry.error || "неизвестно"}`;
+  } else {
+    status = `ЗАБЛОКИРОВАН${logEntry.blockReason ? ` (${logEntry.blockReason})` : ""}`;
   }
 
-  return data.data;
+  let ocoLine = "";
+  if (logEntry.oco) {
+    if (logEntry.oco.paper) {
+      ocoLine = `**OCO (paper):** SELL qty=${logEntry.oco.params.quantity} | TP=${logEntry.oco.params.price} | SL stop=${logEntry.oco.params.stopPrice} → limit=${logEntry.oco.params.stopLimitPrice}`;
+    } else if (logEntry.oco.placed) {
+      ocoLine = `**OCO:** ✅ list ${logEntry.oco.orderListId}`;
+    } else {
+      ocoLine = `**OCO:** ❌ ${logEntry.oco.error || "not placed"}`;
+    }
+  }
+
+  const ind = logEntry.indicators;
+  const fvgCell = ind.fvg
+    ? `${ind.fvg.type} ${ind.fvg.bottom.toFixed(2)}–${ind.fvg.top.toFixed(2)} (${ind.fvg.barsAgo} bars ago)`
+    : "—";
+  const sweepCell = ind.sweep
+    ? `${ind.sweep.levelName} swept @ $${ind.sweep.sweepPrice.toFixed(2)} (${ind.sweep.barsAgo} bars ago)`
+    : "—";
+  const indicatorsSnapshot = [
+    `| Индикатор | Значение |`,
+    `|-----------|---------|`,
+    `| Цена | $${logEntry.price.toFixed(2)} |`,
+    `| Kill Zone | ${ind.killZone || "—"} |`,
+    `| HTF EMA(50) 1H | ${ind.htfEma ? "$" + ind.htfEma.toFixed(2) : "N/A"} |`,
+    `| HTF Bias | ${ind.bias || "—"} |`,
+    `| PDH / PDL | ${ind.pdh ? "$" + ind.pdh.toFixed(2) : "N/A"} / ${ind.pdl ? "$" + ind.pdl.toFixed(2) : "N/A"} |`,
+    `| Liquidity Sweep | ${sweepCell} |`,
+    `| FVG | ${fvgCell} |`,
+    `| Удаление от HTF EMA | ${ind.distancePct !== null ? ind.distancePct.toFixed(2) + "%" : "N/A"} |`,
+    `| Stop / Target | ${logEntry.stopLoss ? "$" + logEntry.stopLoss.toFixed(2) : "—"} / ${logEntry.takeProfit ? "$" + logEntry.takeProfit.toFixed(2) : "—"} |`,
+  ].join("\n");
+
+  const entry = [
+    `## ${dateStr} ${timeStr} — ${logEntry.symbol}`,
+    ``,
+    `**Тип:** ${tradeType} | **Статус:** ${status} | **Режим:** ${logEntry.paperTrading ? "Paper" : "Live"} | **Таймфрейм:** ${logEntry.timeframe}`,
+    `**Цена входа:** $${logEntry.price.toFixed(2)} | **Размер позиции:** $${logEntry.tradeSize.toFixed(2)}`,
+    logEntry.orderId ? `**Order ID:** ${logEntry.orderId}` : "",
+    ocoLine || "",
+    ``,
+    `### Обоснование`,
+    ``,
+    rationale,
+    ``,
+    `### Состояние индикаторов`,
+    ``,
+    indicatorsSnapshot,
+    ``,
+    `---`,
+    ``,
+  ].filter((l) => l !== null).join("\n");
+
+  if (!existsSync(JOURNAL_FILE)) {
+    writeFileSync(JOURNAL_FILE, `# Trading Journal\n\n`);
+  }
+  appendFileSync(JOURNAL_FILE, entry);
+  console.log(`Дневник сделок обновлён → ${JOURNAL_FILE}`);
+}
+
+// ─── Telegram Notifications ──────────────────────────────────────────────────
+
+async function sendTelegram(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID empty) — skipping.");
+    return;
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.log(`⚠️  Telegram API error: ${err}`);
+    } else {
+      console.log("Telegram report sent ✓");
+    }
+  } catch (err) {
+    console.log(`⚠️  Telegram send failed: ${err.message}`);
+  }
+}
+
+function buildTelegramReport(logEntry) {
+  const ind = logEntry.indicators;
+  const status = logEntry.allPass
+    ? logEntry.paperTrading
+      ? "📋 PAPER TRADE"
+      : logEntry.orderPlaced
+        ? "🔴 LIVE ORDER ✅"
+        : `❌ ORDER FAILED: ${logEntry.error || ""}`
+    : `🚫 BLOCKED${logEntry.blockReason ? ` — ${logEntry.blockReason}` : ""}`;
+
+  const lines = [
+    `*ICT Silver Bullet — ${logEntry.symbol} ${logEntry.timeframe}*`,
+    `${status}`,
+    ``,
+    `*Price:* $${logEntry.price.toFixed(2)}`,
+    `*Kill Zone:* ${ind.killZone || "—"}`,
+    `*HTF Bias:* ${ind.bias || "—"} (EMA50 1H = ${ind.htfEma ? "$" + ind.htfEma.toFixed(2) : "N/A"})`,
+    `*PDH / PDL:* ${ind.pdh ? "$" + ind.pdh.toFixed(2) : "N/A"} / ${ind.pdl ? "$" + ind.pdl.toFixed(2) : "N/A"}`,
+    `*Sweep:* ${ind.sweep ? `${ind.sweep.levelName} @ $${ind.sweep.sweepPrice.toFixed(2)} (${ind.sweep.barsAgo} bars ago)` : "—"}`,
+    `*FVG:* ${ind.fvg ? `${ind.fvg.type} $${ind.fvg.bottom.toFixed(2)}–$${ind.fvg.top.toFixed(2)}` : "—"}`,
+  ];
+
+  if (logEntry.allPass && logEntry.side) {
+    lines.push(
+      ``,
+      `*Side:* ${logEntry.side.toUpperCase()}`,
+      `*Stop:* $${logEntry.stopLoss.toFixed(2)}`,
+      `*Target:* $${logEntry.takeProfit.toFixed(2)}`,
+    );
+    if (logEntry.oco) {
+      if (logEntry.oco.paper) {
+        lines.push(
+          `*OCO (paper):* qty=${logEntry.oco.params.quantity}, TP=${logEntry.oco.params.price}, SL stop=${logEntry.oco.params.stopPrice}/limit=${logEntry.oco.params.stopLimitPrice}`,
+        );
+      } else if (logEntry.oco.placed) {
+        lines.push(`*OCO:* ✅ list ${logEntry.oco.orderListId}`);
+      } else {
+        lines.push(`*OCO:* ❌ ${logEntry.oco.error || "not placed"}`);
+      }
+    }
+  } else {
+    const failed = logEntry.conditions.filter((c) => !c.pass).map((c) => `• ${c.label}`);
+    if (failed.length) {
+      lines.push(``, `*Failed:*`, ...failed);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -416,11 +465,11 @@ function writeTradeCsv(logEntry) {
       .filter((c) => !c.pass)
       .map((c) => c.label)
       .join("; ");
-    mode = "BLOCKED";
+    mode = logEntry.blockReason ? `BLOCKED:${logEntry.blockReason}` : "BLOCKED";
     orderId = "BLOCKED";
     notes = `Failed: ${failed}`;
   } else if (logEntry.paperTrading) {
-    side = "BUY";
+    side = (logEntry.side || "buy").toUpperCase();
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -429,7 +478,7 @@ function writeTradeCsv(logEntry) {
     mode = "PAPER";
     notes = "All conditions met";
   } else {
-    side = "BUY";
+    side = (logEntry.side || "buy").toUpperCase();
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -442,7 +491,7 @@ function writeTradeCsv(logEntry) {
   const row = [
     date,
     time,
-    "BitGet",
+    "Binance",
     logEntry.symbol,
     side,
     quantity,
@@ -463,6 +512,27 @@ function writeTradeCsv(logEntry) {
   console.log(`Tax record saved → ${CSV_FILE}`);
 }
 
+// Returns the most recent PAPER/LIVE trade for `symbol` within the last `hours`
+// hours, or null if none. Used to dedupe entries on the same setup.
+function recentTradeForSymbol(symbol, hours = 4) {
+  if (!existsSync(CSV_FILE)) return null;
+  const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
+  const cutoff = Date.now() - hours * 60 * 60 * 1000;
+  let latest = null;
+  for (const line of lines.slice(1)) {
+    if (!/^\d{4}-\d{2}-\d{2},/.test(line)) continue; // skip non-data rows
+    const parts = line.split(",");
+    if (parts.length < 12) continue;
+    const [date, time, , sym, , , , , , , orderId, mode] = parts;
+    if (sym !== symbol) continue;
+    if (mode !== "PAPER" && mode !== "LIVE") continue;
+    const ts = Date.parse(`${date}T${time}Z`);
+    if (isNaN(ts) || ts < cutoff) continue;
+    if (!latest || ts > latest.ts) latest = { date, time, mode, orderId, ts };
+  }
+  return latest;
+}
+
 // Tax summary command: node bot.js --tax-summary
 function generateTaxSummary() {
   if (!existsSync(CSV_FILE)) {
@@ -475,7 +545,7 @@ function generateTaxSummary() {
 
   const live = rows.filter((r) => r[11] === "LIVE");
   const paper = rows.filter((r) => r[11] === "PAPER");
-  const blocked = rows.filter((r) => r[11] === "BLOCKED");
+  const blocked = rows.filter((r) => r[11]?.startsWith("BLOCKED"));
 
   const totalVolume = live.reduce((sum, r) => sum + parseFloat(r[7] || 0), 0);
   const totalFees = live.reduce((sum, r) => sum + parseFloat(r[8] || 0), 0);
@@ -493,6 +563,207 @@ function generateTaxSummary() {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function processSymbol(symbol, timeframe, log) {
+  console.log("\n═══════════════════════════════════════════════════════════");
+  console.log(`  ▶ ${symbol} | ${timeframe}`);
+  console.log("═══════════════════════════════════════════════════════════");
+
+  if (countTodaysTrades(log) >= CONFIG.maxTradesPerDay) {
+    console.log(`🚫 Daily trade limit reached — skipping ${symbol}`);
+    return;
+  }
+
+  console.log("\n── Fetching market data from Binance ───────────────────\n");
+  const evalResult = await evaluateEntry({ symbol, timeframe });
+  const { price, indicators, conditions, side, stopLoss, takeProfit } = evalResult;
+
+  console.log(`  Current price: $${price.toFixed(2)}`);
+  console.log(`  Kill Zone: ${indicators.killZone || "—"}`);
+  console.log(`  HTF EMA(${STRATEGY.htfEmaPeriod}) ${STRATEGY.htfTimeframe}: ${indicators.htfEma ? "$" + indicators.htfEma.toFixed(2) : "N/A"}`);
+  console.log(`  HTF Bias: ${indicators.bias || "—"}`);
+  console.log(`  FVG: ${indicators.fvg ? `${indicators.fvg.type} (${indicators.fvg.bottom.toFixed(2)}–${indicators.fvg.top.toFixed(2)})` : "none"}`);
+
+  const tradeSize = Math.min(
+    CONFIG.portfolioValue * 0.01,
+    CONFIG.maxTradeSizeUSD,
+  );
+
+  // Pre-trade gate 1: dedup — no PAPER/LIVE trade for this symbol within last 4h
+  const recent = recentTradeForSymbol(symbol, 4);
+  conditions.push({
+    pass: !recent,
+    label: "No duplicate trade in last 4h",
+    required: "no PAPER/LIVE entry on this symbol within 4h",
+    actual: recent
+      ? `last ${recent.mode} entry @ ${recent.date} ${recent.time} UTC`
+      : "none",
+  });
+
+  // Pre-trade gate 2: balance check — sufficient free USDT for trade size
+  let usdtBalance = null;
+  let balanceError = null;
+  try {
+    usdtBalance = await getBalanceUSDT();
+  } catch (err) {
+    balanceError = err.message;
+    console.log(`⚠️  Balance check failed: ${err.message}`);
+  }
+  if (usdtBalance !== null) {
+    conditions.push({
+      pass: usdtBalance >= tradeSize,
+      label: "Sufficient USDT balance",
+      required: `>= $${tradeSize.toFixed(2)} free`,
+      actual: `$${usdtBalance.toFixed(2)} free`,
+    });
+  }
+
+  // Pre-trade gate 3: spot mode cannot execute SHORT — base asset not held.
+  // SHORT setups require futures account; on spot they are blocked at entry.
+  const spotLongOnly = process.env.BINANCE_FUTURES !== "true";
+  if (spotLongOnly && side === "sell") {
+    conditions.push({
+      pass: false,
+      label: "Spot mode supports LONG only",
+      required: "side=buy (long) for spot account",
+      actual: "side=sell (short) — requires futures",
+    });
+  }
+
+  const allPass = conditions.every((c) => c.pass);
+
+  console.log("\n── Safety Check ─────────────────────────────────────────\n");
+  for (const c of conditions) {
+    console.log(`  ${c.pass ? "✅" : "🚫"} ${c.label}`);
+    console.log(`     Required: ${c.required} | Actual: ${c.actual}`);
+  }
+
+  // Compute block reason for journal/Telegram visibility
+  let blockReason = null;
+  if (!allPass) {
+    const insufficient = conditions.find(
+      (c) => c.label === "Sufficient USDT balance" && !c.pass,
+    );
+    const dup = conditions.find(
+      (c) => c.label === "No duplicate trade in last 4h" && !c.pass,
+    );
+    const spotShort = conditions.find(
+      (c) => c.label === "Spot mode supports LONG only" && !c.pass,
+    );
+    if (insufficient) blockReason = "INSUFFICIENT_FUNDS";
+    else if (dup) blockReason = "DEDUP";
+    else if (spotShort) blockReason = "SPOT_NO_SHORT";
+    else blockReason = "STRATEGY";
+  }
+
+  console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    symbol,
+    timeframe,
+    price,
+    indicators,
+    conditions,
+    allPass,
+    side,
+    stopLoss,
+    takeProfit,
+    tradeSize,
+    orderPlaced: false,
+    orderId: null,
+    paperTrading: CONFIG.paperTrading,
+    blockReason,
+    usdtBalance,
+    balanceError,
+    oco: null,
+    limits: {
+      maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
+      maxTradesPerDay: CONFIG.maxTradesPerDay,
+      tradesToday: countTodaysTrades(log),
+    },
+  };
+
+  if (!allPass) {
+    const failed = conditions.filter((r) => !r.pass).map((r) => r.label);
+    console.log(`🚫 TRADE BLOCKED${blockReason ? ` — ${blockReason}` : ""}`);
+    console.log(`   Failed conditions:`);
+    failed.forEach((f) => console.log(`   - ${f}`));
+  } else {
+    console.log(`✅ ALL CONDITIONS MET — ${side?.toUpperCase()} setup`);
+    console.log(`   Stop: $${stopLoss?.toFixed(2)}  Target: $${takeProfit?.toFixed(2)}`);
+
+    // Build OCO params (works in both paper and live — needs symbol filters)
+    let ocoParams = null;
+    try {
+      const filters = await getSymbolFilters(symbol);
+      ocoParams = buildOcoParams({
+        symbol,
+        side,
+        quantity: tradeSize / price,
+        takeProfit,
+        stopLoss,
+        filters,
+      });
+    } catch (err) {
+      console.log(`⚠️  Could not build OCO params: ${err.message}`);
+      logEntry.oco = { placed: false, error: err.message };
+    }
+
+    if (CONFIG.paperTrading) {
+      console.log(
+        `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${tradeSize.toFixed(2)} at market`,
+      );
+      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+      logEntry.orderPlaced = true;
+      logEntry.orderId = `PAPER-${Date.now()}`;
+      if (ocoParams) {
+        console.log(`📋 OCO would be sent:`);
+        console.log(`   side=${ocoParams.side} qty=${ocoParams.quantity}`);
+        console.log(`   TP limit=${ocoParams.price} | SL stop=${ocoParams.stopPrice} → limit=${ocoParams.stopLimitPrice}`);
+        logEntry.oco = { placed: false, paper: true, params: ocoParams };
+      }
+    } else {
+      console.log(
+        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side?.toUpperCase()} ${symbol}`,
+      );
+      try {
+        const order = await placeBinanceOrder(symbol, side, tradeSize);
+        logEntry.orderPlaced = true;
+        logEntry.orderId = order.orderId;
+        console.log(`✅ ORDER PLACED — ${order.orderId}`);
+
+        // Place OCO immediately after fill
+        if (ocoParams) {
+          try {
+            const oco = await placeOcoOrder(ocoParams);
+            logEntry.oco = { placed: true, orderListId: oco.orderListId, params: ocoParams };
+            console.log(`✅ OCO PLACED — list ${oco.orderListId}`);
+          } catch (ocoErr) {
+            logEntry.oco = { placed: false, error: ocoErr.message, params: ocoParams };
+            console.log(`❌ OCO FAILED — ${ocoErr.message}`);
+          }
+        }
+      } catch (err) {
+        console.log(`❌ ORDER FAILED — ${err.message}`);
+        logEntry.error = err.message;
+      }
+    }
+  }
+
+  log.trades.push(logEntry);
+  saveLog(log);
+  console.log(`\nDecision log saved → ${LOG_FILE}`);
+
+  const rationale = buildRationale(evalResult);
+  writeJournalEntry(logEntry, rationale);
+
+  writeTradeCsv(logEntry);
+
+  await sendTelegram(buildTelegramReport(logEntry));
+}
+
 async function run() {
   checkOnboarding();
   initCsv();
@@ -504,12 +775,15 @@ async function run() {
   );
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
-  console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  const watchlist = Array.isArray(rules.watchlist) && rules.watchlist.length > 0
+    ? rules.watchlist
+    : [CONFIG.symbol];
+  const timeframe = CONFIG.timeframe || rules.default_timeframe || "15m";
 
-  // Load log and check daily limits
+  console.log(`\nStrategy: ${rules.strategy.name}`);
+  console.log(`Watchlist: ${watchlist.join(", ")} | Timeframe: ${timeframe}`);
+
   const log = loadLog();
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
@@ -517,103 +791,21 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
-  const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
+  for (let i = 0; i < watchlist.length; i++) {
+    const symbol = watchlist[i];
+    try {
+      await processSymbol(symbol, timeframe, log);
+    } catch (err) {
+      console.error(`❌ ${symbol} failed:`, err.message);
+    }
 
-  // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
-
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
-
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
-    return;
-  }
-
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
-
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  // Decision
-  console.log("\n── Decision ─────────────────────────────────────────────\n");
-
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
-    timeframe: CONFIG.timeframe,
-    price,
-    indicators: { ema8, vwap, rsi3 },
-    conditions: results,
-    allPass,
-    tradeSize,
-    orderPlaced: false,
-    orderId: null,
-    paperTrading: CONFIG.paperTrading,
-    limits: {
-      maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
-      maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(log),
-    },
-  };
-
-  if (!allPass) {
-    const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
-    failed.forEach((f) => console.log(`   - ${f}`));
-  } else {
-    console.log(`✅ ALL CONDITIONS MET`);
-
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
-      logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
-    } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
-      );
-      try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
-        logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
-      }
+    if (i < watchlist.length - 1) {
+      console.log("\n⏱  Waiting 1.5s before next symbol (Binance rate limits)...");
+      await sleep(1500);
     }
   }
 
-  // Save decision log
-  log.trades.push(logEntry);
-  saveLog(log);
-  console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
-  writeTradeCsv(logEntry);
-
-  console.log("═══════════════════════════════════════════════════════════\n");
+  console.log("\n═══════════════════════════════════════════════════════════\n");
 }
 
 if (process.argv.includes("--tax-summary")) {

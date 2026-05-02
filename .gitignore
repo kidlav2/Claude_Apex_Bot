@@ -2,3 +2,11 @@
 *.log
 safety-check-log.json
 node_modules/
+
+# Trade execution logs — contain real order IDs, balances, broker history.
+# Keep local only.
+trades.csv
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
