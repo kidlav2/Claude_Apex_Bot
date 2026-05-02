@@ -149,6 +149,15 @@ function formatStep(value, step) {
   return rounded.toFixed(decimals);
 }
 
+// Round UP to next step — use for entry quantity so the resulting notional
+// is always >= the requested sizeUSD (otherwise floor can push us below
+// MIN_NOTIONAL on small orders).
+function formatStepUp(value, step) {
+  const decimals = (step.toString().split(".")[1] || "").length;
+  const rounded = Math.ceil(value / step) * step;
+  return rounded.toFixed(decimals);
+}
+
 // MARKET entry order. side = "buy" or "sell".
 // Uses ONE-WAY mode (positionSide=BOTH). For HEDGE mode, pass positionSide="LONG" or "SHORT".
 async function placeBinanceOrder(symbol, side, sizeUSD, options = {}) {
@@ -157,7 +166,9 @@ async function placeBinanceOrder(symbol, side, sizeUSD, options = {}) {
   const ticker = await publicRequest("/fapi/v1/ticker/price", { symbol });
   const price = parseFloat(ticker.price);
   const rawQty = sizeUSD / price;
-  const quantity = formatStep(rawQty, filters.stepSize);
+  // Round UP so the actual notional is >= sizeUSD (avoids MIN_NOTIONAL miss
+  // when sizeUSD is just slightly above the minimum).
+  const quantity = formatStepUp(rawQty, filters.stepSize);
 
   if (parseFloat(quantity) * price < filters.minNotional) {
     throw new Error(`Order size $${(parseFloat(quantity) * price).toFixed(2)} below MIN_NOTIONAL $${filters.minNotional}`);

@@ -35,7 +35,7 @@ import {
 } from "./binance-futures.js";
 
 const SYMBOL = "SOLUSDT";
-const TEST_USD = 5; // smallest meaningful order ($5 ≈ 0.06 SOL)
+const TEST_USD = 7; // ≈ MIN_NOTIONAL ($5) plus buffer for ceil-rounding
 
 function header(text) {
   console.log("\n" + "═".repeat(60));
