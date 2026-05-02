@@ -686,7 +686,7 @@ async function processSymbol(symbol, timeframe, log) {
           if (oco.orderListId) {
             console.log(`✅ OCO PLACED — list ${oco.orderListId}`);
           } else {
-            console.log(`✅ BRACKET PLACED — TP=${oco.tpOrderId} SL=${oco.slOrderId}`);
+            console.log(`✅ BRACKET PLACED — TP algoId=${oco.tpAlgoId} SL algoId=${oco.slAlgoId}`);
           }
         } catch (ocoErr) {
           logEntry.oco = { placed: false, error: ocoErr.message };

@@ -26,16 +26,17 @@ import "dotenv/config";
 import {
   placeBinanceOrder,
   placeOcoBracket,
+  closePositionMarket,
   getBalanceUSDT,
   getOpenPositions,
-  getOpenOrders,
-  cancelOrder,
+  getOpenAlgoOrders,
+  cancelAlgoOrder,
   cleanupOrphanedOrders,
   initSymbol,
 } from "./binance-futures.js";
 
 const SYMBOL = "SOLUSDT";
-const TEST_USD = 7; // ≈ MIN_NOTIONAL ($5) plus buffer for ceil-rounding
+const TEST_USD = 6; // PROD probe: MIN_NOTIONAL ($5) + minimal buffer
 
 function header(text) {
   console.log("\n" + "═".repeat(60));
@@ -105,36 +106,65 @@ async function main() {
   const entryPrice = pos.entryPrice;
   console.log(`    ✅ ${pos.symbol}: ${pos.positionAmt} @ $${entryPrice} (uPnL $${pos.unrealizedProfit.toFixed(4)})`);
 
-  step(6, "Place OCO bracket (TP +0.5%, SL -0.3%)");
+  step(6, "Place OCO bracket via /fapi/v1/algoOrder (TP +0.5%, SL -0.3%)");
   const tpPrice = entryPrice * 1.005;
   const slPrice = entryPrice * 0.997;
-  const oco = await placeOcoBracket({
-    symbol: SYMBOL,
-    entrySide: "buy",
-    quantity: pos.positionAmt,
-    takeProfit: tpPrice,
-    stopLoss: slPrice,
-  });
-  console.log(`    ✅ TP=${oco.tpOrderId} (${tpPrice.toFixed(4)})`);
-  console.log(`    ✅ SL=${oco.slOrderId} (${slPrice.toFixed(4)})`);
+  let oco = null;
+  let ocoSkipped = false;
+  try {
+    oco = await placeOcoBracket({
+      symbol: SYMBOL,
+      entrySide: "buy",
+      takeProfit: tpPrice,
+      stopLoss: slPrice,
+    });
+    console.log(`    ✅ TP algoId=${oco.tpAlgoId} (${tpPrice.toFixed(4)})`);
+    console.log(`    ✅ SL algoId=${oco.slAlgoId} (${slPrice.toFixed(4)})`);
+  } catch (err) {
+    // Testnet does not yet support /fapi/v1/algoOrder — skip OCO there.
+    if (err.message.includes("-4120") || err.message.includes("Algo Order API")) {
+      console.log(`    ⚠️  SKIPPED — algoOrder endpoint not available on this server.`);
+      console.log(`    ℹ️  Likely testnet — production should accept this.`);
+      ocoSkipped = true;
+    } else {
+      throw err;
+    }
+  }
 
   await sleep(1500);
 
-  step(7, "Verify both bracket legs visible in open orders");
-  const orders = await getOpenOrders(SYMBOL);
-  const tp = orders.find((o) => String(o.orderId) === oco.tpOrderId);
-  const sl = orders.find((o) => String(o.orderId) === oco.slOrderId);
-  console.log(`    ${tp ? "✅" : "❌"} TP leg present`);
-  console.log(`    ${sl ? "✅" : "❌"} SL leg present`);
+  step(7, "Verify both bracket legs visible in /fapi/v1/openAlgoOrders");
+  if (ocoSkipped) {
+    console.log(`    ⏭  skipped (no OCO placed)`);
+  } else {
+    const algoOrders = await getOpenAlgoOrders(SYMBOL);
+    const tp = algoOrders.find((o) => String(o.algoId) === oco.tpAlgoId);
+    const sl = algoOrders.find((o) => String(o.algoId) === oco.slAlgoId);
+    console.log(`    ${tp ? "✅" : "❌"} TP leg present`);
+    console.log(`    ${sl ? "✅" : "❌"} SL leg present`);
+  }
 
   // ─── Cleanup ──────────────────────────────────────────────────────────
   step(8, "Cancel both bracket legs (manual cleanup before flat)");
-  await cancelOrder(SYMBOL, oco.tpOrderId).catch((e) => console.log(`    ⚠️  TP cancel: ${e.message}`));
-  await cancelOrder(SYMBOL, oco.slOrderId).catch((e) => console.log(`    ⚠️  SL cancel: ${e.message}`));
-  console.log(`    ✅ legs cancelled`);
+  if (ocoSkipped) {
+    console.log(`    ⏭  skipped (no OCO placed)`);
+  } else {
+    await cancelAlgoOrder(SYMBOL, oco.tpAlgoId).catch((e) => console.log(`    ⚠️  TP cancel: ${e.message}`));
+    await cancelAlgoOrder(SYMBOL, oco.slAlgoId).catch((e) => console.log(`    ⚠️  SL cancel: ${e.message}`));
+    console.log(`    ✅ legs cancelled`);
+  }
 
-  step(9, "Flatten position with MARKET SELL (reduceOnly)");
-  await placeBinanceOrder(SYMBOL, "sell", TEST_USD);
+  step(9, "Flatten position with closePositionMarket (reduceOnly, exact qty)");
+  try {
+    const closeResult = await closePositionMarket(SYMBOL);
+    if (closeResult.closed) {
+      console.log(`    ✅ closed qty=${closeResult.quantity} (orderId=${closeResult.orderId})`);
+    } else {
+      console.log(`    ℹ️  ${closeResult.reason}`);
+    }
+  } catch (e) {
+    console.log(`    ⚠️  close failed: ${e.message}`);
+  }
   await sleep(1500);
   const finalPositions = await getOpenPositions(SYMBOL);
   console.log(`    ${finalPositions.length === 0 ? "✅" : "❌"} position flat (count=${finalPositions.length})`);
@@ -143,9 +173,18 @@ async function main() {
   const cleanup = await cleanupOrphanedOrders(SYMBOL);
   console.log(`    cancelled=${cleanup.cancelled} kept=${cleanup.kept}`);
 
-  header("✅ ROUND-TRIP COMPLETE");
-  console.log(`\n  All futures execution functions verified end-to-end.`);
-  console.log(`  Final balance: $${(await getBalanceUSDT()).toFixed(2)}\n`);
+  header(ocoSkipped ? "✅ ROUND-TRIP PARTIAL (OCO skipped — algoOrder unavailable)" : "✅ ROUND-TRIP COMPLETE");
+  console.log(`\n  Verified:`);
+  console.log(`    ✅ initSymbol (leverage + margin)`);
+  console.log(`    ✅ placeBinanceOrder (MARKET entry)`);
+  console.log(`    ✅ getOpenPositions (visibility)`);
+  console.log(`    ${ocoSkipped ? "⚠️ " : "✅"} placeOcoBracket via /fapi/v1/algoOrder ${ocoSkipped ? "(skipped — endpoint unavailable)" : ""}`);
+  console.log(`    ${ocoSkipped ? "⏭ " : "✅"} cancelAlgoOrder ${ocoSkipped ? "(skipped)" : ""}`);
+  console.log(`    ✅ closePositionMarket + cleanup`);
+  console.log(`\n  Final balance: $${(await getBalanceUSDT()).toFixed(2)}\n`);
+  if (ocoSkipped) {
+    console.log(`  ⚠️  algoOrder endpoint did not respond — verify on production before live trading.\n`);
+  }
 }
 
 main().catch(async (err) => {

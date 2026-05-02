@@ -141,6 +141,23 @@ async function cancelOrder(symbol, orderId) {
   return signedRequest("DELETE", "/fapi/v1/order", { symbol, orderId });
 }
 
+// ─── Algo (conditional) orders ─────────────────────────────────────────────
+//
+// As of Binance's 2025-12-09 migration, conditional types (STOP_MARKET,
+// TAKE_PROFIT_MARKET, STOP, TAKE_PROFIT, TRAILING_STOP_MARKET) MUST be placed
+// on /fapi/v1/algoOrder. The legacy /fapi/v1/order returns -4120 for these.
+// They are also queried/cancelled through algo-specific endpoints — they do
+// NOT appear in /fapi/v1/openOrders.
+
+async function getOpenAlgoOrders(symbol = null) {
+  return signedRequest("GET", "/fapi/v1/openAlgoOrders", symbol ? { symbol } : {});
+}
+
+async function cancelAlgoOrder(symbol, algoId) {
+  // symbol is not strictly required by the API but we pass it for clarity/logs.
+  return signedRequest("DELETE", "/fapi/v1/algoOrder", { algoId });
+}
+
 // ─── Order placement ────────────────────────────────────────────────────────
 
 function formatStep(value, step) {
@@ -184,36 +201,45 @@ async function placeBinanceOrder(symbol, side, sizeUSD, options = {}) {
   return { orderId: String(data.orderId), executedQty: parseFloat(data.executedQty || quantity), raw: data };
 }
 
-// Futures has no atomic OCO. We place SL and TP as two separate reduceOnly
-// orders. The caller MUST track both orderIds and cancel the survivor when
-// one fills (see syncOrphanedOrders below).
-async function placeOcoBracket({ symbol, entrySide, quantity, takeProfit, stopLoss }) {
+// Futures has no atomic OCO. We place SL and TP as two separate algo orders
+// that both close the entire position when triggered. closePosition=true is
+// mutually exclusive with quantity/reduceOnly — Binance auto-determines the
+// qty from the open position at trigger time. This is exactly the "bracket"
+// semantic we need: one leg fills → position is flat → the other leg
+// becomes a no-op (still needs explicit cancel via cleanupOrphanedOrders to
+// free the slot).
+//
+// As of 2025-12-09, conditional orders MUST go through /fapi/v1/algoOrder
+// with algoType=CONDITIONAL and triggerPrice (renamed from stopPrice).
+// Legacy /fapi/v1/order returns -4120 for these types globally — testnet
+// AND prod. The IDs returned here are algoIds, not regular orderIds, and
+// must be cancelled via /fapi/v1/algoOrder DELETE (not /fapi/v1/order).
+async function placeOcoBracket({ symbol, entrySide, takeProfit, stopLoss }) {
   const filters = await getSymbolFilters(symbol);
   // Exit side is opposite of entry
   const exitSide = entrySide === "buy" ? "SELL" : "BUY";
-  const tpPrice = formatStep(takeProfit, filters.tickSize);
-  const slStop = formatStep(stopLoss, filters.tickSize);
-  const qty = formatStep(quantity, filters.stepSize);
+  const tpTrigger = formatStep(takeProfit, filters.tickSize);
+  const slTrigger = formatStep(stopLoss, filters.tickSize);
 
-  // TAKE_PROFIT_MARKET — triggers MARKET sell when price hits stopPrice
+  // workingType=MARK_PRICE protects from wick-outs vs LAST_PRICE.
+  // priceProtect=true blocks trigger if mark/last spread is abnormal.
   const tpParams = {
+    algoType: "CONDITIONAL",
     symbol,
     side: exitSide,
     type: "TAKE_PROFIT_MARKET",
-    stopPrice: tpPrice,
-    quantity: qty,
-    reduceOnly: "true",
-    workingType: "MARK_PRICE", // trigger off mark price (less wick-prone than last)
+    triggerPrice: tpTrigger,
+    closePosition: "true",
+    workingType: "MARK_PRICE",
     priceProtect: "true",
   };
-  // STOP_MARKET — triggers MARKET sell when price hits stopPrice
   const slParams = {
+    algoType: "CONDITIONAL",
     symbol,
     side: exitSide,
     type: "STOP_MARKET",
-    stopPrice: slStop,
-    quantity: qty,
-    reduceOnly: "true",
+    triggerPrice: slTrigger,
+    closePosition: "true",
     workingType: "MARK_PRICE",
     priceProtect: "true",
   };
@@ -221,42 +247,82 @@ async function placeOcoBracket({ symbol, entrySide, quantity, takeProfit, stopLo
   // Place both. If one fails, cancel the other.
   let tpOrder, slOrder;
   try {
-    tpOrder = await signedRequest("POST", "/fapi/v1/order", tpParams);
+    tpOrder = await signedRequest("POST", "/fapi/v1/algoOrder", tpParams);
   } catch (err) {
     throw new Error(`TP placement failed: ${err.message}`);
   }
   try {
-    slOrder = await signedRequest("POST", "/fapi/v1/order", slParams);
+    slOrder = await signedRequest("POST", "/fapi/v1/algoOrder", slParams);
   } catch (err) {
     // Roll back TP if SL fails — never leave an unbalanced bracket
-    await cancelOrder(symbol, tpOrder.orderId).catch(() => {});
+    await cancelAlgoOrder(symbol, tpOrder.algoId).catch(() => {});
     throw new Error(`SL placement failed (TP rolled back): ${err.message}`);
   }
 
   return {
-    tpOrderId: String(tpOrder.orderId),
-    slOrderId: String(slOrder.orderId),
-    params: { symbol, exitSide, qty, tpPrice, slStop },
+    tpAlgoId: String(tpOrder.algoId),
+    slAlgoId: String(slOrder.algoId),
+    params: { symbol, exitSide, tpTrigger, slTrigger, closePosition: true },
   };
+}
+
+// ─── Exit / flatten ─────────────────────────────────────────────────────────
+
+// Closes the current position with a MARKET reduceOnly order using the exact
+// positionAmt — avoids the formatStepUp overshoot that placeBinanceOrder uses
+// for entries (which would leave a small opposite-side residue when flattening).
+async function closePositionMarket(symbol) {
+  const positions = await getOpenPositions(symbol);
+  const pos = positions.find((p) => p.symbol === symbol);
+  if (!pos) return { closed: false, reason: "no position" };
+  const qty = Math.abs(pos.positionAmt);
+  const side = pos.positionAmt > 0 ? "SELL" : "BUY";
+  const filters = await getSymbolFilters(symbol);
+  const quantity = formatStep(qty, filters.stepSize);
+  const data = await signedRequest("POST", "/fapi/v1/order", {
+    symbol,
+    side,
+    type: "MARKET",
+    quantity,
+    reduceOnly: "true",
+  });
+  return { closed: true, orderId: String(data.orderId), quantity };
 }
 
 // ─── Sibling cleanup ────────────────────────────────────────────────────────
 
-// Walks all open SL/TP orders for `symbol` and cancels the survivor when
+// Walks all open SL/TP algo orders for `symbol` and cancels the survivor when
 // the corresponding position is closed (i.e., the other leg already fired).
 // Call this at the start of each processSymbol() to clean up after fills
 // that happened between bot runs.
+//
+// Post-2025-12-09, our bracket legs live in /fapi/v1/openAlgoOrders, not
+// /fapi/v1/openOrders. We still scan regular open orders too in case any
+// legacy reduceOnly entries exist from before the migration.
 async function cleanupOrphanedOrders(symbol) {
-  const [orders, positions] = await Promise.all([
-    getOpenOrders(symbol),
+  const [algoOrders, regularOrders, positions] = await Promise.all([
+    getOpenAlgoOrders(symbol).catch(() => []),
+    getOpenOrders(symbol).catch(() => []),
     getOpenPositions(symbol),
   ]);
   const hasPosition = positions.some((p) => p.symbol === symbol);
-  if (hasPosition) return { cancelled: 0, kept: orders.length };
+  if (hasPosition) {
+    return { cancelled: 0, kept: algoOrders.length + regularOrders.length };
+  }
 
-  const reduceOnlyOrders = orders.filter((o) => o.reduceOnly === true || o.reduceOnly === "true");
   let cancelled = 0;
-  for (const o of reduceOnlyOrders) {
+  // Cancel orphaned algo bracket legs (closePosition=true legs from placeOcoBracket)
+  for (const o of algoOrders) {
+    await cancelAlgoOrder(symbol, o.algoId).catch(() => {});
+    cancelled++;
+  }
+  // Belt-and-suspenders: cancel any legacy reduceOnly/closePosition leftovers
+  // on the regular order book (shouldn't exist post-migration but cheap to handle).
+  const legacyOrphans = regularOrders.filter((o) =>
+    o.closePosition === true || o.closePosition === "true" ||
+    o.reduceOnly === true || o.reduceOnly === "true",
+  );
+  for (const o of legacyOrphans) {
     await cancelOrder(symbol, o.orderId).catch(() => {});
     cancelled++;
   }
@@ -287,6 +353,7 @@ async function initSymbol(symbol, leverage = 1, marginType = "ISOLATED") {
 export {
   placeBinanceOrder,
   placeOcoBracket,
+  closePositionMarket,
   getBalanceUSDT,
   getSymbolFilters,
   setLeverage,
@@ -294,7 +361,9 @@ export {
   initSymbol,
   getOpenPositions,
   getOpenOrders,
+  getOpenAlgoOrders,
   cancelOrder,
+  cancelAlgoOrder,
   cleanupOrphanedOrders,
   checkFundingRate,
 };
