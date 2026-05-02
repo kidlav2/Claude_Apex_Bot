@@ -123,20 +123,27 @@ function checkTradeLimits(log) {
     `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
   );
 
+  // Use MAX_TRADE_SIZE_USD as the explicit trade size. Capped at 50% of
+  // portfolio for safety on small accounts. Below Binance MIN_NOTIONAL ($5)
+  // the order will be rejected by the exchange anyway.
   const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
     CONFIG.maxTradeSizeUSD,
+    CONFIG.portfolioValue * 0.5,
   );
 
-  if (tradeSize > CONFIG.maxTradeSizeUSD) {
+  if (tradeSize < 5) {
     console.log(
-      `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
+      `🚫 Trade size $${tradeSize.toFixed(2)} below Binance MIN_NOTIONAL ($5)`,
+    );
+    console.log(
+      `   Increase MAX_TRADE_SIZE_USD or PORTFOLIO_VALUE_USD in .env`,
     );
     return false;
   }
 
+  const pctOfPortfolio = (tradeSize / CONFIG.portfolioValue) * 100;
   console.log(
-    `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
+    `✅ Trade size: $${tradeSize.toFixed(2)} (${pctOfPortfolio.toFixed(1)}% of $${CONFIG.portfolioValue} portfolio)`,
   );
 
   return true;
@@ -585,9 +592,12 @@ async function processSymbol(symbol, timeframe, log) {
   console.log(`  HTF Bias: ${indicators.bias || "—"}`);
   console.log(`  FVG: ${indicators.fvg ? `${indicators.fvg.type} (${indicators.fvg.bottom.toFixed(2)}–${indicators.fvg.top.toFixed(2)})` : "none"}`);
 
+  // Use MAX_TRADE_SIZE_USD as the explicit trade size. Capped at 50% of
+  // portfolio for safety on small accounts. Below Binance MIN_NOTIONAL ($5)
+  // the order will be rejected by the exchange anyway.
   const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
     CONFIG.maxTradeSizeUSD,
+    CONFIG.portfolioValue * 0.5,
   );
 
   // Pre-trade gate 1: dedup — no PAPER/LIVE trade for this symbol within last 4h
