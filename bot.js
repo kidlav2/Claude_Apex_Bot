@@ -29,6 +29,7 @@ const {
   getOpenPositions,
   cleanupOrphanedOrders,
   checkFundingRate,
+  closePositionMarket, // futures-only; undefined on spot
 } = broker;
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
@@ -771,8 +772,134 @@ async function run() {
   console.log("\n═══════════════════════════════════════════════════════════\n");
 }
 
+// ─── Hard Time Stop (--close-only) ──────────────────────────────────────────
+//
+// Triggered by cron at the end of each kill zone window. Closes any open
+// futures position by MARKET reduceOnly and cancels orphaned bracket legs.
+// Does NOT evaluate strategy or open new positions.
+
+async function closeAllPositions() {
+  const reason = "Hard time stop — kill zone end";
+  console.log("\n═══════════════════════════════════════════════════════════");
+  console.log("  Claude Trading Bot — CLOSE-ONLY mode");
+  console.log(`  ${new Date().toISOString()}`);
+  console.log(`  Reason: ${reason}`);
+  console.log("═══════════════════════════════════════════════════════════\n");
+
+  if (!USE_FUTURES) {
+    console.log("⚠️  --close-only is futures-only. Spot positions are managed by atomic OCO.");
+    return;
+  }
+  if (CONFIG.paperTrading) {
+    console.log("📋 PAPER mode — no live positions to close.");
+    return;
+  }
+
+  let positions;
+  try {
+    positions = await getOpenPositions();
+  } catch (err) {
+    console.error(`❌ Could not fetch positions: ${err.message}`);
+    process.exit(1);
+  }
+
+  if (positions.length === 0) {
+    console.log("✅ No open positions — nothing to close.");
+    await sendTelegram(
+      `*Hard Time Stop*\n_${new Date().toISOString().slice(11, 16)} UTC_\nNo open positions.`,
+    );
+    return;
+  }
+
+  console.log(`Found ${positions.length} open position(s):`);
+  for (const p of positions) {
+    const dir = p.positionAmt > 0 ? "LONG" : "SHORT";
+    console.log(
+      `  ${p.symbol}: ${dir} ${Math.abs(p.positionAmt)} @ $${p.entryPrice} ` +
+        `(mark $${p.markPrice}, uPnL $${p.unrealizedProfit.toFixed(4)})`,
+    );
+  }
+  console.log();
+
+  const results = [];
+  for (const p of positions) {
+    const exitSide = p.positionAmt > 0 ? "SELL" : "BUY";
+    try {
+      const result = await closePositionMarket(p.symbol);
+      console.log(`✅ ${p.symbol} closed — order ${result.orderId} (qty ${result.quantity})`);
+      try {
+        const cleanup = await cleanupOrphanedOrders(p.symbol);
+        if (cleanup.cancelled > 0) {
+          console.log(`   🧹 Cancelled ${cleanup.cancelled} orphaned bracket leg(s)`);
+        }
+      } catch (cleanupErr) {
+        console.log(`   ⚠️  ${p.symbol} cleanup failed: ${cleanupErr.message}`);
+      }
+      appendCloseRow({
+        symbol: p.symbol,
+        exitSide,
+        qty: Math.abs(p.positionAmt),
+        markPrice: p.markPrice,
+        unrealizedPnl: p.unrealizedProfit,
+        orderId: result.orderId,
+        reason,
+      });
+      results.push({ symbol: p.symbol, ok: true, orderId: result.orderId, uPnL: p.unrealizedProfit });
+    } catch (err) {
+      console.log(`❌ ${p.symbol} close failed: ${err.message}`);
+      appendCloseRow({
+        symbol: p.symbol,
+        exitSide,
+        qty: Math.abs(p.positionAmt),
+        markPrice: p.markPrice,
+        unrealizedPnl: p.unrealizedProfit,
+        orderId: "FAILED",
+        reason: `${reason} — ERROR: ${err.message}`,
+      });
+      results.push({ symbol: p.symbol, ok: false, error: err.message });
+    }
+  }
+
+  const reportLines = [
+    `*Hard Time Stop — Kill Zone End*`,
+    ``,
+    `Closed ${results.filter((r) => r.ok).length}/${results.length} position(s):`,
+  ];
+  for (const r of results) {
+    if (r.ok) reportLines.push(`✅ ${r.symbol} — order ${r.orderId} (uPnL $${r.uPnL.toFixed(4)})`);
+    else reportLines.push(`❌ ${r.symbol} — ${r.error}`);
+  }
+  await sendTelegram(reportLines.join("\n"));
+  console.log("\n═══════════════════════════════════════════════════════════\n");
+}
+
+function appendCloseRow({ symbol, exitSide, qty, markPrice, unrealizedPnl, orderId, reason }) {
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19);
+  const total = (qty * markPrice).toFixed(2);
+  const fee = (qty * markPrice * 0.0005).toFixed(4); // 0.05% taker fee
+  const net = (parseFloat(total) - parseFloat(fee)).toFixed(2);
+  const row = [
+    date, time, "Binance", symbol, exitSide,
+    qty.toFixed(6), markPrice.toFixed(2), total, fee, net,
+    orderId, "LIVE_CLOSE",
+    `"${reason} | uPnL=${unrealizedPnl.toFixed(4)}"`,
+  ].join(",");
+  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
+  appendFileSync(CSV_FILE, row + "\n");
+  console.log(`   Tax record saved → ${CSV_FILE}`);
+}
+
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
+} else if (process.argv.includes("--close-only")) {
+  checkOnboarding();
+  initCsv();
+  closeAllPositions().catch((err) => {
+    console.error("Close-only error:", err);
+    process.exit(1);
+  });
 } else {
   run().catch((err) => {
     console.error("Bot error:", err);
