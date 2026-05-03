@@ -10,3 +10,10 @@ trades.csv
 # macOS metadata
 .DS_Store
 **/.DS_Store
+
+# Local-only files — dev/backtest/personal
+trading_journal.md
+backtest.js
+backtest_final_results.md
+test-*.js
+railway.json
