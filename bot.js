@@ -12,7 +12,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { execSync } from "child_process";
-import { STRATEGY, evaluateEntry, buildRationale } from "./strategy.js";
+import { STRATEGY, evaluateEntry, buildRationale, activeKillZone, minutesLeftInKillZone } from "./strategy.js";
 
 // Broker module is selected by env flag. Both modules export the same surface
 // so processSymbol() doesn't care which is loaded.
@@ -56,6 +56,7 @@ function checkOnboarding() {
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
         "TIMEFRAME=15m",
+        "MIN_MINUTES_LEFT_TO_ENTRY=25",
       ].join("\n") + "\n",
     );
     try {
@@ -95,6 +96,7 @@ const CONFIG = {
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
+  minMinutesLeftToEntry: parseInt(process.env.MIN_MINUTES_LEFT_TO_ENTRY || "25"),
   binance: {
     apiKey: process.env.BINANCE_API_KEY,
     secretKey: process.env.BINANCE_SECRET_KEY,
@@ -103,6 +105,7 @@ const CONFIG = {
 };
 
 const LOG_FILE = "safety-check-log.json";
+const SESSION_BUFFER_FILE = "session_buffer.json";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -245,6 +248,33 @@ function writeJournalEntry(logEntry, rationale) {
   console.log(`Дневник сделок обновлён → ${JOURNAL_FILE}`);
 }
 
+// ─── Session Buffer ───────────────────────────────────────────────────────────
+
+function loadSessionBuffer() {
+  if (!existsSync(SESSION_BUFFER_FILE)) return { session: null, date: null, entries: [] };
+  try {
+    return JSON.parse(readFileSync(SESSION_BUFFER_FILE, "utf8"));
+  } catch {
+    return { session: null, date: null, entries: [] };
+  }
+}
+
+function appendSessionBuffer(killZone, symbol, primaryReason) {
+  const buf = loadSessionBuffer();
+  const today = new Date().toISOString().slice(0, 10);
+  if (buf.date !== today || buf.session !== killZone) {
+    buf.session = killZone;
+    buf.date = today;
+    buf.entries = [];
+  }
+  buf.entries.push({ symbol, reason: primaryReason, time: new Date().toISOString().slice(11, 16) });
+  writeFileSync(SESSION_BUFFER_FILE, JSON.stringify(buf, null, 2));
+}
+
+function clearSessionBuffer() {
+  writeFileSync(SESSION_BUFFER_FILE, JSON.stringify({ session: null, date: null, entries: [] }, null, 2));
+}
+
 // ─── Telegram Notifications ──────────────────────────────────────────────────
 
 async function sendTelegram(text) {
@@ -319,6 +349,31 @@ function buildTelegramReport(logEntry) {
   }
 
   return lines.join("\n");
+}
+
+async function sendSessionSummary(killZone) {
+  const buf = loadSessionBuffer();
+  if (!buf.entries || buf.entries.length === 0) {
+    console.log(`Session summary: no blocked scans recorded for ${killZone}.`);
+    return;
+  }
+
+  const bySymbol = {};
+  for (const e of buf.entries) {
+    if (!bySymbol[e.symbol]) bySymbol[e.symbol] = {};
+    bySymbol[e.symbol][e.reason] = (bySymbol[e.symbol][e.reason] || 0) + 1;
+  }
+
+  const lines = [`*Session Summary — ${killZone} Kill Zone*`, ``];
+  for (const [sym, reasons] of Object.entries(bySymbol)) {
+    const total = Object.values(reasons).reduce((a, b) => a + b, 0);
+    const [topReason, topCount] = Object.entries(reasons).sort((a, b) => b[1] - a[1])[0];
+    lines.push(`• ${sym}: ${total} скан(ов) — чаще всего: _${topReason}_ (${topCount}×)`);
+  }
+
+  console.log(`Sending session summary for ${killZone}...`);
+  await sendTelegram(lines.join("\n"));
+  clearSessionBuffer();
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -649,6 +704,10 @@ async function processSymbol(symbol, timeframe, log) {
     console.log(`🚫 TRADE BLOCKED${blockReason ? ` — ${blockReason}` : ""}`);
     console.log(`   Failed conditions:`);
     failed.forEach((f) => console.log(`   - ${f}`));
+
+    // Accumulate rejection reasons for session summary — no instant Telegram
+    const primaryReason = failed[0] || blockReason || "Unknown";
+    appendSessionBuffer(indicators.killZone || "Unknown", symbol, primaryReason);
   } else {
     console.log(`✅ ALL CONDITIONS MET — ${side?.toUpperCase()} setup`);
     console.log(`   Stop: $${stopLoss?.toFixed(2)}  Target: $${takeProfit?.toFixed(2)}`);
@@ -709,7 +768,11 @@ async function processSymbol(symbol, timeframe, log) {
 
   writeTradeCsv(logEntry);
 
-  await sendTelegram(buildTelegramReport(logEntry));
+  // Instant Telegram only for opened/closed trades; blocked runs are silent
+  // (accumulated into session_buffer and sent as one summary at KZ end).
+  if (allPass) {
+    await sendTelegram(buildTelegramReport(logEntry));
+  }
 }
 
 async function run() {
@@ -722,6 +785,34 @@ async function run() {
     `  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Broker: ${USE_FUTURES ? "FUTURES (1×)" : "SPOT"}`,
   );
   console.log("═══════════════════════════════════════════════════════════");
+
+  // ── Kill Zone gate ────────────────────────────────────────────────────────
+  // With 5-min cron running all day, exit immediately outside active windows.
+  const killZone = activeKillZone();
+  const minsLeft = minutesLeftInKillZone();
+  const isLastRun = minsLeft > 0 && minsLeft <= 5;
+
+  if (!killZone) {
+    console.log("No active kill zone — exiting.");
+    return;
+  }
+  console.log(`Kill Zone: ${killZone} | ${minsLeft} min remaining`);
+
+  // ── Entry cutoff ──────────────────────────────────────────────────────────
+  // Don't open new entries too late in the window. Still send session summary
+  // on the last run so the report lands even when entry was cut off.
+  if (minsLeft < CONFIG.minMinutesLeftToEntry) {
+    console.log(`⏰ Entry cutoff — ${minsLeft} min left < ${CONFIG.minMinutesLeftToEntry} min threshold. No new entries.`);
+    if (isLastRun) {
+      const rules = JSON.parse(readFileSync("rules.json", "utf8"));
+      const watchlist = Array.isArray(rules.watchlist) && rules.watchlist.length > 0
+        ? rules.watchlist
+        : [CONFIG.symbol];
+      console.log(`Last run of ${killZone} kill zone — sending session summary.`);
+      await sendSessionSummary(killZone);
+    }
+    return;
+  }
 
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   const watchlist = Array.isArray(rules.watchlist) && rules.watchlist.length > 0
@@ -767,6 +858,12 @@ async function run() {
       console.log("\n⏱  Waiting 1.5s before next symbol (Binance rate limits)...");
       await sleep(1500);
     }
+  }
+
+  // Last run of the kill zone — send session summary and clear buffer.
+  if (isLastRun) {
+    console.log(`\nLast run of ${killZone} kill zone — sending session summary.`);
+    await sendSessionSummary(killZone);
   }
 
   console.log("\n═══════════════════════════════════════════════════════════\n");

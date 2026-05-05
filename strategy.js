@@ -26,12 +26,26 @@ function nyHour(date = new Date()) {
   return parseInt(fmt.format(date), 10);
 }
 
+function nyMinute(date = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: NY_TZ,
+    minute: "numeric",
+  });
+  return parseInt(fmt.format(date), 10);
+}
+
 function activeKillZone(date = new Date()) {
   const h = nyHour(date);
   if (h === 3) return "London";
   if (h === 10) return "AM";
   if (h === 14) return "PM";
   return null;
+}
+
+// Returns minutes remaining in the current kill zone (0 if not in one).
+function minutesLeftInKillZone(date = new Date()) {
+  if (!activeKillZone(date)) return 0;
+  return 60 - nyMinute(date);
 }
 
 // ─── Market data ─────────────────────────────────────────────────────────────
@@ -364,4 +378,4 @@ function buildRationale(evalResult) {
     .join("\n");
 }
 
-export { STRATEGY, fetchCandles, evaluateEntry, evaluateBars, buildRationale, activeKillZone };
+export { STRATEGY, fetchCandles, evaluateEntry, evaluateBars, buildRationale, activeKillZone, minutesLeftInKillZone };
