@@ -2,9 +2,11 @@
  * ICT Silver Bullet — strategy module.
  *
  * Three time-of-day windows (Kill Zones, New York time):
- *   - London SB  03:00–04:00 NY
- *   - AM SB      10:00–11:00 NY
- *   - PM SB      14:00–15:00 NY
+ *   - London SB  03:00–04:00 NY  → 07:00–08:00 UTC (EDT, UTC-4) / 08:00–09:00 UTC (EST, UTC-5)
+ *   - AM SB      10:00–11:00 NY  → 14:00–15:00 UTC (EDT) / 15:00–16:00 UTC (EST)
+ *   - PM SB      14:00–15:00 NY  → 18:00–19:00 UTC (EDT) / 19:00–20:00 UTC (EST)
+ *
+ * Timezone is handled via Intl.DateTimeFormat("America/New_York") — DST is automatic.
  *
  * Entry logic (per kill zone):
  *   1. We must be inside an active kill zone.

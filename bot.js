@@ -52,7 +52,7 @@ function checkOnboarding() {
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
         "MAX_TRADE_SIZE_USD=100",
-        "MAX_TRADES_PER_DAY=3",
+        "MAX_TRADES_PER_DAY=5",
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
         "TIMEFRAME=15m",
@@ -94,7 +94,7 @@ const CONFIG = {
   timeframe: process.env.TIMEFRAME || "15m",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "5"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   minMinutesLeftToEntry: parseInt(process.env.MIN_MINUTES_LEFT_TO_ENTRY || "25"),
   binance: {
@@ -118,30 +118,70 @@ function saveLog(log) {
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
 }
 
-function countTodaysTrades(log) {
+// Counts only executed trades today (mode=PAPER or LIVE in CSV).
+// Blocked/rejected decisions are never counted regardless of orderPlaced flag.
+function countTodaysTrades() {
+  if (!existsSync(CSV_FILE)) return 0;
   const today = new Date().toISOString().slice(0, 10);
-  return log.trades.filter(
-    (t) => t.timestamp.startsWith(today) && t.orderPlaced,
-  ).length;
+  const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
+  let count = 0;
+  for (const line of lines.slice(1)) {
+    if (!line.startsWith(today)) continue;
+    const parts = line.split(",");
+    if (parts.length < 12) continue;
+    const mode = parts[11];
+    if (mode === "PAPER" || mode === "LIVE") count++;
+  }
+  return count;
+}
+
+// ─── Loss Limit ──────────────────────────────────────────────────────────────
+
+const MAX_LOSSES_PER_DAY = 3;
+
+// Counts closed losing trades today from trades.csv (LIVE_CLOSE rows with uPnL < 0).
+function getTodayLossCount() {
+  if (!existsSync(CSV_FILE)) return 0;
+  const today = new Date().toISOString().slice(0, 10);
+  const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
+  let count = 0;
+  for (const line of lines.slice(1)) {
+    if (!line.startsWith(today)) continue;
+    const parts = line.split(",");
+    if (parts.length < 13) continue;
+    if (parts[11] !== "LIVE_CLOSE") continue;
+    const notes = parts.slice(12).join(",").replace(/^"|"$/g, "");
+    const match = notes.match(/uPnL=([-\d.]+)/);
+    if (match && parseFloat(match[1]) < 0) count++;
+  }
+  return count;
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
 
-function checkTradeLimits(log) {
-  const todayCount = countTodaysTrades(log);
+// Returns { allowed: boolean, reason: string }
+function checkTradeLimits() {
+  const todayCount = countTodaysTrades();
+  const lossCount = getTodayLossCount();
 
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
+
+  if (lossCount >= MAX_LOSSES_PER_DAY) {
+    console.log(
+      `🚫 Loss limit reached: ${lossCount}/${MAX_LOSSES_PER_DAY} losing trades today`,
+    );
+    return { allowed: false, reason: "LOSS_LIMIT" };
+  }
 
   if (todayCount >= CONFIG.maxTradesPerDay) {
     console.log(
       `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
     );
-    return false;
+    return { allowed: false, reason: "TRADE_CAP" };
   }
 
-  console.log(
-    `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
-  );
+  console.log(`✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`);
+  console.log(`✅ Losses today: ${lossCount}/${MAX_LOSSES_PER_DAY} — within limit`);
 
   // Use MAX_TRADE_SIZE_USD as the explicit trade size. Capped at 50% of
   // portfolio for safety on small accounts. Below Binance MIN_NOTIONAL ($5)
@@ -158,7 +198,7 @@ function checkTradeLimits(log) {
     console.log(
       `   Increase MAX_TRADE_SIZE_USD or PORTFOLIO_VALUE_USD in .env`,
     );
-    return false;
+    return { allowed: false, reason: "TRADE_SIZE" };
   }
 
   const pctOfPortfolio = (tradeSize / CONFIG.portfolioValue) * 100;
@@ -166,7 +206,7 @@ function checkTradeLimits(log) {
     `✅ Trade size: $${tradeSize.toFixed(2)} (${pctOfPortfolio.toFixed(1)}% of $${CONFIG.portfolioValue} portfolio)`,
   );
 
-  return true;
+  return { allowed: true, reason: null };
 }
 
 // ─── Trading Journal ─────────────────────────────────────────────────────────
@@ -311,8 +351,9 @@ function buildTelegramReport(logEntry) {
         : `❌ ORDER FAILED: ${logEntry.error || ""}`
     : `🚫 BLOCKED${logEntry.blockReason ? ` — ${logEntry.blockReason}` : ""}`;
 
+  const modeTag = logEntry.paperTrading ? " 📋 PAPER" : "";
   const lines = [
-    `*ICT Silver Bullet — ${logEntry.symbol} ${logEntry.timeframe}*`,
+    `*ICT Silver Bullet — ${logEntry.symbol} ${logEntry.timeframe}${modeTag}*`,
     `${status}`,
     ``,
     `*Price:* $${logEntry.price.toFixed(2)}`,
@@ -530,8 +571,8 @@ async function processSymbol(symbol, timeframe, log) {
   console.log(`  ▶ ${symbol} | ${timeframe} | ${USE_FUTURES ? "FUTURES" : "SPOT"}`);
   console.log("═══════════════════════════════════════════════════════════");
 
-  if (countTodaysTrades(log) >= CONFIG.maxTradesPerDay) {
-    console.log(`🚫 Daily trade limit reached — skipping ${symbol}`);
+  if (countTodaysTrades() >= CONFIG.maxTradesPerDay || getTodayLossCount() >= MAX_LOSSES_PER_DAY) {
+    console.log(`🚫 Daily limit reached — skipping ${symbol}`);
     return;
   }
 
@@ -695,7 +736,7 @@ async function processSymbol(symbol, timeframe, log) {
     limits: {
       maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
       maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(log),
+      tradesToday: countTodaysTrades(),
     },
   };
 
@@ -840,8 +881,14 @@ async function run() {
   }
 
   const log = loadLog();
-  const withinLimits = checkTradeLimits(log);
-  if (!withinLimits) {
+  const limits = checkTradeLimits();
+  if (!limits.allowed) {
+    const msg = limits.reason === "LOSS_LIMIT"
+      ? `🚫 *Loss limit reached* — ${MAX_LOSSES_PER_DAY} losing trades today. Bot stopped for the day.`
+      : limits.reason === "TRADE_CAP"
+        ? `🚫 *Daily trade cap reached* — ${CONFIG.maxTradesPerDay} trades today. Bot stopped.`
+        : null;
+    if (msg) await sendTelegram(msg);
     console.log("\nBot stopping — trade limits reached for today.");
     return;
   }
