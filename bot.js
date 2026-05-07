@@ -351,7 +351,7 @@ function buildTelegramReport(logEntry) {
         : `❌ ORDER FAILED: ${logEntry.error || ""}`
     : `🚫 BLOCKED${logEntry.blockReason ? ` — ${logEntry.blockReason}` : ""}`;
 
-  const modeTag = logEntry.paperTrading ? " 📋 PAPER" : "";
+  const modeTag = logEntry.paperTrading ? " [📋 PAPER]" : " [🔴 LIVE]";
   const lines = [
     `*ICT Silver Bullet — ${logEntry.symbol} ${logEntry.timeframe}${modeTag}*`,
     `${status}`,
@@ -365,9 +365,11 @@ function buildTelegramReport(logEntry) {
   ];
 
   if (logEntry.allPass && logEntry.side) {
+    const qty = (logEntry.tradeSize / logEntry.price).toFixed(6);
     lines.push(
       ``,
       `*Side:* ${logEntry.side.toUpperCase()}`,
+      `*Size:* $${logEntry.tradeSize.toFixed(2)} (qty ${qty})`,
       `*Stop:* $${logEntry.stopLoss.toFixed(2)}`,
       `*Target:* $${logEntry.takeProfit.toFixed(2)}`,
     );
@@ -792,6 +794,53 @@ async function processSymbol(symbol, timeframe, log) {
         } catch (ocoErr) {
           logEntry.oco = { placed: false, error: ocoErr.message };
           console.log(`❌ OCO FAILED — ${ocoErr.message}`);
+          console.log(`🚨 GHOST POSITION RISK — attempting emergency market close...`);
+
+          // Ghost position guard: entry filled but bracket failed → flatten
+          // immediately by MARKET reduceOnly. Without this the position sits
+          // unprotected until the next cron tick (up to 5 min of naked risk).
+          let emergency = { ok: false, error: "not attempted" };
+          if (USE_FUTURES && typeof closePositionMarket === "function") {
+            try {
+              const closeResult = await closePositionMarket(symbol);
+              emergency = {
+                ok: true,
+                orderId: closeResult.orderId,
+                qty: closeResult.quantity,
+              };
+              console.log(`✅ EMERGENCY CLOSE — order ${closeResult.orderId} (qty ${closeResult.quantity})`);
+              // Belt-and-suspenders: cancel any orphaned bracket leg that
+              // survived placeOcoBracket's rollback (e.g., TP placed, SL
+              // failed, TP cancel also failed).
+              try {
+                const cleanup = await cleanupOrphanedOrders(symbol);
+                if (cleanup.cancelled > 0) {
+                  console.log(`   🧹 Cancelled ${cleanup.cancelled} orphan(s) post-close`);
+                }
+              } catch {}
+            } catch (closeErr) {
+              emergency = { ok: false, error: closeErr.message };
+              console.log(`❌ EMERGENCY CLOSE FAILED — ${closeErr.message}`);
+            }
+          } else {
+            emergency = { ok: false, error: "spot mode — manual action required" };
+          }
+          logEntry.emergencyClose = emergency;
+
+          // High-priority Telegram alert — fires regardless of allPass gate below.
+          await sendTelegram([
+            `🚨 *GHOST POSITION ALERT — ${symbol}*`,
+            ``,
+            `Entry order ✅ FILLED but OCO ❌ FAILED.`,
+            ``,
+            `*Entry:* ${side?.toUpperCase()} ${filledQty} @ ~$${price.toFixed(2)}`,
+            `*Notional:* ~$${tradeSize.toFixed(2)}`,
+            `*OCO error:* \`${ocoErr.message}\``,
+            ``,
+            emergency.ok
+              ? `✅ *Emergency close executed* — order \`${emergency.orderId}\``
+              : `❌ *Emergency close FAILED:* \`${emergency.error}\`\n\n⚠️ *MANUAL INTERVENTION REQUIRED* — open Binance now and flatten ${symbol} immediately.`,
+          ].join("\n"));
         }
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
@@ -1005,7 +1054,7 @@ async function closeAllPositions() {
   }
 
   const reportLines = [
-    `*Hard Time Stop — Kill Zone End*`,
+    `*Hard Time Stop — Kill Zone End* [🔴 LIVE]`,
     ``,
     `Closed ${results.filter((r) => r.ok).length}/${results.length} position(s):`,
   ];
