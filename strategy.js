@@ -157,6 +157,27 @@ function findRecentSweep(ltfCandles, bias, pdh, pdl, lookback) {
   return null;
 }
 
+// HTF structure filter. Detects a series of 1-bar swing pivots that monotonically
+// move against the bias direction (Lower Highs for long, Higher Lows for short).
+// Used to veto setups where local FVG aligns with bias but the higher timeframe
+// is rolling over — protects from buying into a topping structure (08.05 BTC).
+function isStructureAgainstBias(htfCandles, bias, swings = 3) {
+  if (!bias || htfCandles.length < swings * 2 + 2) return false;
+  const pivots = [];
+  for (let i = 1; i < htfCandles.length - 1; i++) {
+    const c = htfCandles[i], p = htfCandles[i - 1], n = htfCandles[i + 1];
+    if (bias === "long" && c.high > p.high && c.high > n.high) pivots.push(c.high);
+    if (bias === "short" && c.low < p.low && c.low < n.low) pivots.push(c.low);
+  }
+  if (pivots.length < swings) return false;
+  const recent = pivots.slice(-swings);
+  for (let i = 1; i < recent.length; i++) {
+    if (bias === "long" && recent[i] >= recent[i - 1]) return false;
+    if (bias === "short" && recent[i] <= recent[i - 1]) return false;
+  }
+  return true;
+}
+
 // ─── Strategy evaluation ─────────────────────────────────────────────────────
 
 const STRATEGY = {
@@ -166,12 +187,18 @@ const STRATEGY = {
   ltfEmaPeriod: 20,
   fvgLookbackBars: 20,
   sweepLookbackBars: 192,
+  // Sweep must be fresh — older liquidity grabs lose predictive value.
+  // 15 LTF bars = 3.75h on 15m, well within current Kill Zone influence.
+  maxSweepAgeBars: 15,
   riskRewardRatio: 2,
   maxDistancePctFromHtfEma: 1.5,
   atrPeriod: 14,
   atrSlBuffer: 0.5,
   minStopDistancePct: 0.004,
   dailyEmaPeriod: 20,
+  // HTF structure filter — number of consecutive Lower Highs (longs) /
+  // Higher Lows (shorts) that veto a setup against the bias direction.
+  htfStructureSwings: 3,
 };
 
 // Pure evaluation — operates on already-fetched bars. Used by both live bot
@@ -227,11 +254,36 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
     distancePct !== null && distancePct < STRATEGY.maxDistancePctFromHtfEma,
   );
 
+  const sweepFresh = sweep && sweep.barsAgo <= STRATEGY.maxSweepAgeBars;
   check(
     "Liquidity sweep of PDH/PDL aligned with bias",
-    bias === "long" ? "wick below PDL, close back above" : bias === "short" ? "wick above PDH, close back below" : "n/a",
-    sweep ? `${sweep.levelName} swept ${sweep.barsAgo} bars ago at $${sweep.sweepPrice.toFixed(2)}` : "none",
-    Boolean(sweep),
+    bias === "long"
+      ? `wick below PDL within ${STRATEGY.maxSweepAgeBars} bars`
+      : bias === "short"
+        ? `wick above PDH within ${STRATEGY.maxSweepAgeBars} bars`
+        : "n/a",
+    sweep
+      ? `${sweep.levelName} swept ${sweep.barsAgo} bars ago at $${sweep.sweepPrice.toFixed(2)}${sweep.barsAgo > STRATEGY.maxSweepAgeBars ? " (STALE)" : ""}`
+      : "none",
+    Boolean(sweepFresh),
+  );
+
+  // HTF structure veto — block long setups when 1H is printing Lower Highs,
+  // and short setups when it's printing Higher Lows. Even a valid local FVG
+  // shouldn't override a HTF rollover (08.05 BTC: long FVG into a 4-day series
+  // of lower daily highs).
+  const structureAgainst = isStructureAgainstBias(htfCandles, bias, STRATEGY.htfStructureSwings);
+  check(
+    "HTF structure not against bias",
+    bias === "long"
+      ? `no series of ${STRATEGY.htfStructureSwings} Lower Highs on ${STRATEGY.htfTimeframe}`
+      : bias === "short"
+        ? `no series of ${STRATEGY.htfStructureSwings} Higher Lows on ${STRATEGY.htfTimeframe}`
+        : "n/a",
+    bias && structureAgainst
+      ? bias === "long" ? "Lower Highs detected" : "Higher Lows detected"
+      : "OK",
+    Boolean(bias) && !structureAgainst,
   );
 
   // EMA50 1H slope must align with bias — filters counter-trend entries

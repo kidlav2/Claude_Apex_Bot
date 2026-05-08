@@ -107,6 +107,17 @@ const CONFIG = {
 const LOG_FILE = "safety-check-log.json";
 const SESSION_BUFFER_FILE = "session_buffer.json";
 
+// Dynamic position sizing — when free margin is tight (other open positions
+// have reserved it, available balance fluctuated since last check, etc.),
+// shrink the trade size by 20% per attempt instead of failing the order.
+// Bottoms out at MIN_TRADE_SIZE_USD ($5 — Binance MIN_NOTIONAL).
+const SHRINK_FACTOR = 0.8;
+const MAX_SHRINK_ATTEMPTS = 3;
+const MIN_TRADE_SIZE_USD = 5;
+// Buffer for fees + market-order slippage between margin check and actual fill.
+const MARGIN_BUFFER = 1.05;
+const INSUFFICIENT_MARGIN_RE = /margin is insufficient|insufficient.*balance|insufficient.*margin/i;
+
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 function loadLog() {
@@ -629,12 +640,39 @@ async function processSymbol(symbol, timeframe, log) {
     balanceError = err.message;
     console.log(`⚠️  Balance check failed: ${err.message}`);
   }
+
+  // Dynamic position sizing — shrink trade size by 20% per attempt if free
+  // margin is below required. With LEVERAGE=1 (default) margin == notional;
+  // higher leverage relaxes the margin requirement but we still target full
+  // notional in `tradeSize`, then derive margin from it.
+  const leverage = USE_FUTURES ? parseInt(process.env.LEVERAGE || "1", 10) : 1;
+  let actualTradeSize = tradeSize;
+  let preTradeShrinks = 0;
+  if (!CONFIG.paperTrading && usdtBalance !== null && side) {
+    while (
+      usdtBalance < (actualTradeSize / leverage) * MARGIN_BUFFER &&
+      preTradeShrinks < MAX_SHRINK_ATTEMPTS &&
+      actualTradeSize * SHRINK_FACTOR >= MIN_TRADE_SIZE_USD
+    ) {
+      actualTradeSize *= SHRINK_FACTOR;
+      preTradeShrinks++;
+    }
+    if (preTradeShrinks > 0) {
+      console.log(
+        `⚠️  Margin tight ($${usdtBalance.toFixed(2)} free, lev ${leverage}×) — ` +
+          `shrunk size ${preTradeShrinks}× by 20% → $${actualTradeSize.toFixed(2)} ` +
+          `(was $${tradeSize.toFixed(2)})`,
+      );
+    }
+  }
+
   if (usdtBalance !== null) {
+    const requiredMargin = (actualTradeSize / leverage) * MARGIN_BUFFER;
     conditions.push({
-      pass: usdtBalance >= tradeSize,
+      pass: usdtBalance >= requiredMargin,
       label: "Sufficient USDT balance",
-      required: `>= $${tradeSize.toFixed(2)} free`,
-      actual: `$${usdtBalance.toFixed(2)} free`,
+      required: `>= $${requiredMargin.toFixed(2)} free (size $${actualTradeSize.toFixed(2)} / ${leverage}× × ${MARGIN_BUFFER} buffer)`,
+      actual: `$${usdtBalance.toFixed(2)} free${preTradeShrinks > 0 ? ` (shrunk ${preTradeShrinks}×)` : ""}`,
     });
   }
 
@@ -727,7 +765,9 @@ async function processSymbol(symbol, timeframe, log) {
     side,
     stopLoss,
     takeProfit,
-    tradeSize,
+    tradeSize: actualTradeSize,
+    requestedTradeSize: tradeSize,
+    preTradeShrinks,
     orderPlaced: false,
     orderId: null,
     paperTrading: CONFIG.paperTrading,
@@ -757,7 +797,7 @@ async function processSymbol(symbol, timeframe, log) {
 
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${actualTradeSize.toFixed(2)} at market`,
       );
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       console.log(`   Would OCO: TP=$${takeProfit?.toFixed(2)}, SL=$${stopLoss?.toFixed(2)}`);
@@ -766,13 +806,41 @@ async function processSymbol(symbol, timeframe, log) {
       logEntry.oco = { placed: false, paper: true, takeProfit, stopLoss };
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side?.toUpperCase()} ${symbol} (${USE_FUTURES ? "FUTURES" : "SPOT"})`,
+        `\n🔴 PLACING LIVE ORDER — $${actualTradeSize.toFixed(2)} ${side?.toUpperCase()} ${symbol} (${USE_FUTURES ? "FUTURES" : "SPOT"})`,
       );
-      try {
-        const order = await placeBinanceOrder(symbol, side, tradeSize);
+      // Retry-on-margin loop: if Binance rejects with "Margin is insufficient"
+      // (race between getBalanceUSDT and order: another fill consumed margin,
+      // or cross-margin reserved more than expected), shrink by 20% and retry.
+      // Caps the total shrinks across pre-trade + post-rejection at MAX_SHRINK_ATTEMPTS.
+      let order = null;
+      let lastErr = null;
+      while (!order) {
+        try {
+          order = await placeBinanceOrder(symbol, side, actualTradeSize);
+        } catch (err) {
+          lastErr = err;
+          const isMarginError = INSUFFICIENT_MARGIN_RE.test(err.message);
+          const canShrink =
+            isMarginError &&
+            preTradeShrinks < MAX_SHRINK_ATTEMPTS &&
+            actualTradeSize * SHRINK_FACTOR >= MIN_TRADE_SIZE_USD;
+          if (!canShrink) break;
+          actualTradeSize *= SHRINK_FACTOR;
+          preTradeShrinks++;
+          logEntry.tradeSize = actualTradeSize;
+          logEntry.preTradeShrinks = preTradeShrinks;
+          console.log(
+            `⚠️  Order rejected (margin) — retry ${preTradeShrinks} with $${actualTradeSize.toFixed(2)}`,
+          );
+        }
+      }
+      if (!order) {
+        console.log(`❌ ORDER FAILED — ${lastErr.message}`);
+        logEntry.error = lastErr.message;
+      } else {
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
-        const filledQty = order.executedQty || tradeSize / price;
+        const filledQty = order.executedQty || actualTradeSize / price;
         console.log(`✅ ORDER PLACED — ${order.orderId} (qty=${filledQty})`);
 
         // Place OCO bracket immediately after fill — works for both spot
@@ -834,7 +902,7 @@ async function processSymbol(symbol, timeframe, log) {
             `Entry order ✅ FILLED but OCO ❌ FAILED.`,
             ``,
             `*Entry:* ${side?.toUpperCase()} ${filledQty} @ ~$${price.toFixed(2)}`,
-            `*Notional:* ~$${tradeSize.toFixed(2)}`,
+            `*Notional:* ~$${actualTradeSize.toFixed(2)}`,
             `*OCO error:* \`${ocoErr.message}\``,
             ``,
             emergency.ok
@@ -842,9 +910,6 @@ async function processSymbol(symbol, timeframe, log) {
               : `❌ *Emergency close FAILED:* \`${emergency.error}\`\n\n⚠️ *MANUAL INTERVENTION REQUIRED* — open Binance now and flatten ${symbol} immediately.`,
           ].join("\n"));
         }
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
       }
     }
   }
