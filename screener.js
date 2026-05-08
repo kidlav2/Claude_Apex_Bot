@@ -27,6 +27,9 @@ const SCREENER = {
   minQuoteVolume24h: parseFloat(process.env.SCREENER_MIN_VOLUME || "75000000"),
   // Daily change cap — protects from chasing the tail of a pump/dump.
   maxAbsPriceChangePct24h: parseFloat(process.env.SCREENER_MAX_DAILY_CHANGE || "12"),
+  // Last-price floor — kicks ultra-cheap meme tokens whose noise dominates
+  // PDH/PDL semantics. 0.01 USDT excludes sub-cent shitcoins.
+  minPrice: parseFloat(process.env.SCREENER_MIN_PRICE || "0.01"),
   // How many high-vol symbols to keep beyond anchors.
   topByVolatility: parseInt(process.env.SCREENER_VOL_TOP || "7", 10),
   // 4h on 15m = 16 bars.
@@ -39,7 +42,7 @@ const SCREENER = {
   // Hard exclusions, comma-separated.
   blocklist: (process.env.SCREENER_BLOCKLIST || "")
     .split(",").map(s => s.trim()).filter(Boolean),
-  // Tracks the planned trade size — used in MIN_NOTIONAL health-check.
+  // Tracks the planned trade size — used in MIN_NOTIONAL + LOT_SIZE health-check.
   tradeSizeUsd: parseFloat(process.env.MAX_TRADE_SIZE_USD || "50"),
 };
 
@@ -81,13 +84,17 @@ async function listEligiblePerpetuals() {
       symbol: t.symbol,
       quoteVolume24h: parseFloat(t.quoteVolume),
       priceChangePct24h: parseFloat(t.priceChangePercent),
+      lastPrice: parseFloat(t.lastPrice),
     }))
     .filter(t => t.quoteVolume24h >= SCREENER.minQuoteVolume24h)
-    .filter(t => Math.abs(t.priceChangePct24h) <= SCREENER.maxAbsPriceChangePct24h);
+    .filter(t => Math.abs(t.priceChangePct24h) <= SCREENER.maxAbsPriceChangePct24h)
+    .filter(t => t.lastPrice >= SCREENER.minPrice);
 }
 
 // Step 3 — 4h realized range as volatility metric.
-async function rankByVolatility(symbols) {
+// `lastPriceMap` carries 24h-ticker last prices forward to step 4 so we can
+// LOT_SIZE-validate without an extra mark-price round-trip.
+async function rankByVolatility(symbols, lastPriceMap) {
   const limit = SCREENER.volatilityWindowBars;
   const results = await Promise.all(symbols.map(async (sym) => {
     try {
@@ -98,7 +105,9 @@ async function rankByVolatility(symbols) {
       const high = Math.max(...bars.map(b => parseFloat(b[2])));
       const low = Math.min(...bars.map(b => parseFloat(b[3])));
       if (low <= 0) return null;
-      return { symbol: sym, volPct: ((high - low) / low) * 100, high, low };
+      const close = parseFloat(bars[bars.length - 1][4]);
+      const lastPrice = lastPriceMap.get(sym) || close;
+      return { symbol: sym, volPct: ((high - low) / low) * 100, high, low, lastPrice };
     } catch {
       return null;
     }
@@ -108,8 +117,11 @@ async function rankByVolatility(symbols) {
     .sort((a, b) => b.volPct - a.volPct);
 }
 
-// Step 4 — funding + MIN_NOTIONAL gate.
-async function passesHealthCheck(symbol) {
+// Step 4 — funding + MIN_NOTIONAL + LOT_SIZE gates.
+// `price` is the latest mark/last price used to derive an actual quantity for
+// the planned $tradeSizeUsd — we must round it down to LOT_SIZE.stepSize and
+// confirm the result clears LOT_SIZE.minQty.
+async function passesHealthCheck(symbol, price) {
   try {
     const [premium, exchInfo] = await Promise.all([
       publicGet("/fapi/v1/premiumIndex", { symbol }),
@@ -121,12 +133,30 @@ async function passesHealthCheck(symbol) {
     }
     const info = (exchInfo.symbols || []).find(s => s.symbol === symbol);
     if (!info) return { ok: false, reason: "no exchangeInfo entry" };
+
     const minNotionalFilter = info.filters.find(f => f.filterType === "MIN_NOTIONAL");
     const minNotional = minNotionalFilter ? parseFloat(minNotionalFilter.notional) : 5;
     if (SCREENER.tradeSizeUsd < minNotional) {
       return { ok: false, reason: `MIN_NOTIONAL $${minNotional} > tradeSize $${SCREENER.tradeSizeUsd}` };
     }
-    return { ok: true, fundingRate, minNotional };
+
+    const lotSizeFilter = info.filters.find(f => f.filterType === "LOT_SIZE");
+    if (!lotSizeFilter) return { ok: false, reason: "no LOT_SIZE filter" };
+    const minQty = parseFloat(lotSizeFilter.minQty);
+    const stepSize = parseFloat(lotSizeFilter.stepSize);
+    if (!(price > 0)) return { ok: false, reason: `bad price (${price})` };
+    const rawQty = SCREENER.tradeSizeUsd / price;
+    // bot.js uses formatStepUp on entry so notional ≥ tradeSize. Here we mirror
+    // it to validate that the rounded-up qty also satisfies minQty (it always
+    // will if rawQty does, but cheap to assert).
+    const stepUpQty = stepSize > 0 ? Math.ceil(rawQty / stepSize) * stepSize : rawQty;
+    if (stepUpQty < minQty) {
+      return { ok: false, reason: `qty ${stepUpQty} < LOT_SIZE.minQty ${minQty}` };
+    }
+    // Notional after step-up rounding still inside MIN_NOTIONAL? (very small
+    // qty with large stepSize could overshoot tradeSize, but that's safe; the
+    // dangerous direction is undershoot — already caught above.)
+    return { ok: true, fundingRate, minNotional, minQty, stepSize, computedQty: stepUpQty };
   } catch (err) {
     return { ok: false, reason: `health-check error: ${err.message}` };
   }
@@ -143,13 +173,14 @@ async function buildDynamicWatchlist() {
   // Anchors are guaranteed — exclude them from the volatility race.
   const anchorSet = new Set(SCREENER.anchors);
   const candidatePool = eligible.filter(t => !anchorSet.has(t.symbol));
-  const ranked = await rankByVolatility(candidatePool.map(t => t.symbol));
+  const lastPriceMap = new Map(eligible.map(t => [t.symbol, t.lastPrice]));
+  const ranked = await rankByVolatility(candidatePool.map(t => t.symbol), lastPriceMap);
 
   const picks = [];
   const rejected = [];
   for (const r of ranked) {
     if (picks.length >= SCREENER.topByVolatility) break;
-    const health = await passesHealthCheck(r.symbol);
+    const health = await passesHealthCheck(r.symbol, r.lastPrice);
     if (!health.ok) {
       rejected.push({ symbol: r.symbol, volPct: r.volPct, reason: health.reason });
       continue;
@@ -158,6 +189,8 @@ async function buildDynamicWatchlist() {
       symbol: r.symbol,
       volPct: r.volPct,
       fundingRate: health.fundingRate,
+      lastPrice: r.lastPrice,
+      computedQty: health.computedQty,
     });
   }
 
@@ -202,10 +235,11 @@ function isFresh(cache, date, killZone) {
 //   { source: "error", error: string }                              on screener failure
 //   null                                                            if screener returned no symbols
 //
+// `forceRebuild` — bypass cache (used by `node bot.js --screen` warmup CLI).
 // Caller is expected to fall back to the static watchlist on null/error.
-async function getOrBuildWatchlist({ date, killZone }) {
+async function getOrBuildWatchlist({ date, killZone, forceRebuild = false }) {
   const cache = loadCache();
-  if (isFresh(cache, date, killZone)) {
+  if (!forceRebuild && isFresh(cache, date, killZone)) {
     return {
       source: "cache",
       watchlist: cache.watchlist,

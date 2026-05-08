@@ -418,6 +418,25 @@ function buildTelegramReport(logEntry) {
   return lines.join("\n");
 }
 
+function buildScreenerTelegram(killZone, screen) {
+  const top = screen.picks && screen.picks[0];
+  const lines = [
+    `🔍 *New Dynamic Watchlist — ${killZone}* [🔴 LIVE]`,
+    ``,
+    `\`[${screen.watchlist.join(", ")}]\``,
+  ];
+  if (top) {
+    lines.push(``, `*Top pick:* ${top.symbol} (vol ${top.volPct.toFixed(2)}%, funding ${(top.fundingRate * 100).toFixed(3)}%)`);
+  }
+  if (screen.picks && screen.picks.length > 0) {
+    lines.push(``, `*Picks:*`);
+    for (const p of screen.picks) {
+      lines.push(`• ${p.symbol}  vol ${p.volPct.toFixed(2)}%  funding ${(p.fundingRate * 100).toFixed(3)}%`);
+    }
+  }
+  return lines.join("\n");
+}
+
 async function sendSessionSummary(killZone) {
   const buf = loadSessionBuffer();
   if (!buf.entries || buf.entries.length === 0) {
@@ -1137,6 +1156,11 @@ async function run() {
           console.log(`   • ${p.symbol}  vol ${p.volPct.toFixed(2)}%  funding ${(p.fundingRate * 100).toFixed(3)}%`);
         }
       }
+      // Notify on fresh build only — repeated cache hits inside the same KZ
+      // shouldn't spam Telegram with the same picks.
+      if (screen.source === "fresh") {
+        await sendTelegram(buildScreenerTelegram(killZone, screen));
+      }
     } else if (screen && screen.source === "error") {
       console.log(`⚠️  Dynamic Screener error — fallback to static: ${screen.error}`);
     } else {
@@ -1321,6 +1345,41 @@ function appendCloseRow({ symbol, exitSide, qty, markPrice, unrealizedPnl, order
   console.log(`   Tax record saved → ${CSV_FILE}`);
 }
 
+// CLI: `node bot.js --screen [London|AM|PM]` — manually warm screener_cache.json
+// Useful as a pre-Kill-Zone cron (e.g. 09:55 NY for the AM session) so the
+// first in-zone tick reads cache instead of paying ~1.5s on Binance API.
+async function warmScreener() {
+  const idx = process.argv.indexOf("--screen");
+  const zoneArg = process.argv[idx + 1];
+  const isZone = zoneArg && /^(London|AM|PM)$/i.test(zoneArg);
+  const explicitZone = isZone
+    ? (zoneArg[0].toUpperCase() + zoneArg.slice(1).toLowerCase()).replace("Pm", "PM").replace("Am", "AM")
+    : null;
+  const killZone = explicitZone || activeKillZone();
+  if (!killZone) {
+    console.error("⚠️  No active Kill Zone and no zone specified.");
+    console.error("Usage: node bot.js --screen [London|AM|PM]");
+    process.exit(1);
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  console.log(`🔍 Warming screener cache for ${today} ${killZone}…`);
+  const screen = await getOrBuildWatchlist({ date: today, killZone, forceRebuild: true });
+  if (!screen || !Array.isArray(screen.watchlist) || screen.watchlist.length === 0) {
+    console.error(
+      `❌ Screener returned no symbols${screen && screen.source === "error" ? `: ${screen.error}` : ""}`,
+    );
+    process.exit(1);
+  }
+  console.log(`✅ Cache built (${screen.source}). Watchlist:\n  ${screen.watchlist.join(", ")}`);
+  if (screen.picks && screen.picks.length > 0) {
+    console.log("\nPicks:");
+    for (const p of screen.picks) {
+      console.log(`  • ${p.symbol}  vol ${p.volPct.toFixed(2)}%  funding ${(p.fundingRate * 100).toFixed(3)}%`);
+    }
+  }
+  await sendTelegram(buildScreenerTelegram(killZone, screen));
+}
+
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
 } else if (process.argv.includes("--close-only")) {
@@ -1328,6 +1387,11 @@ if (process.argv.includes("--tax-summary")) {
   initCsv();
   closeAllPositions().catch((err) => {
     console.error("Close-only error:", err);
+    process.exit(1);
+  });
+} else if (process.argv.includes("--screen")) {
+  warmScreener().catch((err) => {
+    console.error("Screener warmup error:", err);
     process.exit(1);
   });
 } else {
