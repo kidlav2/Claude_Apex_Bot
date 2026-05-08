@@ -128,10 +128,17 @@ async function initSymbol() { return null; }              // no leverage/margin 
 async function getOpenPositions() { return []; }          // spot has no "positions" concept
 async function cleanupOrphanedOrders() { return { cancelled: 0, kept: 0 }; }
 async function checkFundingRate() { return { fundingRate: 0, nextFundingTime: 0, markPrice: 0 }; }
+// Spot move-to-BE would require cancelling the entire OCO list and replacing
+// it (TP+SL atomically) — out of scope here. Return a no-op signal so the
+// position manager can skip cleanly on spot.
+async function moveStopLoss() {
+  throw new Error("moveStopLoss not supported on spot — would need OCO replacement");
+}
 
 export {
   placeBinanceOrder,
   placeOcoBracket,
+  moveStopLoss,
   getBalanceUSDT,
   getSymbolFilters,
   initSymbol,

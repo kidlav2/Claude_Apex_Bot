@@ -266,6 +266,55 @@ async function placeOcoBracket({ symbol, entrySide, takeProfit, stopLoss }) {
   };
 }
 
+// ─── Stop-loss management ───────────────────────────────────────────────────
+
+// Cancel the current STOP_MARKET algo order on `symbol` (matched by exitSide)
+// and place a fresh one at `newStopPrice`. Used by move-to-BE when an open
+// position has reached 1R profit.
+//
+// Brief naked-position window: between cancel and replace the position has no
+// SL. We minimize exposure by issuing both calls back-to-back. If the place
+// step fails, the caller MUST react (e.g. emergency closePositionMarket).
+async function moveStopLoss(symbol, exitSide, newStopPrice) {
+  const filters = await getSymbolFilters(symbol);
+  const algoOrders = await getOpenAlgoOrders(symbol);
+  const slOrder = algoOrders.find(
+    (o) => o.type === "STOP_MARKET" && o.side === exitSide,
+  );
+  if (!slOrder) {
+    throw new Error(`No active STOP_MARKET ${exitSide} algo order for ${symbol}`);
+  }
+  const oldAlgoId = slOrder.algoId;
+  const oldTrigger = parseFloat(slOrder.triggerPrice || slOrder.stopPrice);
+  const newTrigger = formatStep(newStopPrice, filters.tickSize);
+
+  // Cancel old SL first — Binance rejects a second STOP_MARKET with
+  // closePosition=true if one is already active on this symbol.
+  await cancelAlgoOrder(symbol, oldAlgoId);
+
+  let newSlOrder;
+  try {
+    newSlOrder = await signedRequest("POST", "/fapi/v1/algoOrder", {
+      algoType: "CONDITIONAL",
+      symbol,
+      side: exitSide,
+      type: "STOP_MARKET",
+      triggerPrice: newTrigger,
+      closePosition: "true",
+      workingType: "MARK_PRICE",
+      priceProtect: "true",
+    });
+  } catch (err) {
+    throw new Error(`NAKED_POSITION: old SL cancelled but new SL placement failed: ${err.message}`);
+  }
+  return {
+    oldAlgoId: String(oldAlgoId),
+    newAlgoId: String(newSlOrder.algoId),
+    oldTrigger,
+    newTrigger: parseFloat(newTrigger),
+  };
+}
+
 // ─── Exit / flatten ─────────────────────────────────────────────────────────
 
 // Closes the current position with a MARKET reduceOnly order using the exact
@@ -353,6 +402,7 @@ async function initSymbol(symbol, leverage = 1, marginType = "ISOLATED") {
 export {
   placeBinanceOrder,
   placeOcoBracket,
+  moveStopLoss,
   closePositionMarket,
   getBalanceUSDT,
   getSymbolFilters,

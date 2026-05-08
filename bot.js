@@ -30,7 +30,11 @@ const {
   cleanupOrphanedOrders,
   checkFundingRate,
   closePositionMarket, // futures-only; undefined on spot
+  moveStopLoss,        // futures-only on real broker; throws on spot
 } = broker;
+// Optional: futures-only algo order helpers needed by manageOpenPositions.
+// Spot module doesn't export them — fall back to no-ops.
+const getOpenAlgoOrders = broker.getOpenAlgoOrders || (async () => []);
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -93,8 +97,10 @@ const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
   timeframe: process.env.TIMEFRAME || "15m",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
+  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "50"),
+  totalExposureLimit: parseFloat(process.env.TOTAL_EXPOSURE_LIMIT || "180"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "5"),
+  leverage: parseInt(process.env.LEVERAGE || "2", 10),
   paperTrading: process.env.PAPER_TRADING !== "false",
   minMinutesLeftToEntry: parseInt(process.env.MIN_MINUTES_LEFT_TO_ENTRY || "25"),
   binance: {
@@ -377,10 +383,11 @@ function buildTelegramReport(logEntry) {
 
   if (logEntry.allPass && logEntry.side) {
     const qty = (logEntry.tradeSize / logEntry.price).toFixed(6);
+    const leverageTag = USE_FUTURES ? `${CONFIG.leverage}× leverage` : "spot (1×)";
     lines.push(
       ``,
       `*Side:* ${logEntry.side.toUpperCase()}`,
-      `*Size:* $${logEntry.tradeSize.toFixed(2)} (qty ${qty})`,
+      `*Size:* $${logEntry.tradeSize.toFixed(2)} (qty ${qty}, ${leverageTag})`,
       `*Stop:* $${logEntry.stopLoss.toFixed(2)}`,
       `*Target:* $${logEntry.takeProfit.toFixed(2)}`,
     );
@@ -575,6 +582,108 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
+// ─── Position Management (move-to-BE) ───────────────────────────────────────
+
+// Walk all open futures positions; for each one with floating profit >= 1R,
+// cancel-and-replace the STOP_MARKET algo order at entry price (breakeven).
+// 1R is the original stop distance (entry − current SL for longs).
+//
+// Skipped on spot (atomic OCO replacement is out of scope) and in paper mode.
+// Re-runs are idempotent: once SL == entry the second call just no-ops.
+async function manageOpenPositions() {
+  if (!USE_FUTURES || CONFIG.paperTrading) return;
+  let positions;
+  try {
+    positions = await getOpenPositions();
+  } catch (err) {
+    console.log(`⚠️  Position management: fetch failed — ${err.message}`);
+    return;
+  }
+  if (positions.length === 0) return;
+
+  console.log(`\n── Position Management — ${positions.length} open ─────────\n`);
+  for (const p of positions) {
+    const isLong = p.positionAmt > 0;
+    const exitSide = isLong ? "SELL" : "BUY";
+    const entry = p.entryPrice;
+    const mark = p.markPrice;
+
+    let algoOrders;
+    try {
+      algoOrders = await getOpenAlgoOrders(p.symbol);
+    } catch (err) {
+      console.log(`  ⚠️  ${p.symbol}: algoOrders fetch failed — ${err.message}`);
+      continue;
+    }
+    const slOrder = algoOrders.find(
+      (o) => o.type === "STOP_MARKET" && o.side === exitSide,
+    );
+    if (!slOrder) {
+      console.log(`  ⚠️  ${p.symbol}: no STOP_MARKET found — skip`);
+      continue;
+    }
+    const slPrice = parseFloat(slOrder.triggerPrice || slOrder.stopPrice);
+
+    // Already at/beyond breakeven — nothing to do.
+    if ((isLong && slPrice >= entry) || (!isLong && slPrice <= entry)) {
+      console.log(`  ✓ ${p.symbol}: SL already at BE+ ($${slPrice} vs entry $${entry})`);
+      continue;
+    }
+
+    const rDistance = isLong ? entry - slPrice : slPrice - entry;
+    const profit = isLong ? mark - entry : entry - mark;
+    const rMultiple = rDistance > 0 ? profit / rDistance : 0;
+    console.log(
+      `  ${p.symbol}: entry $${entry} mark $${mark} SL $${slPrice} → ${rMultiple >= 0 ? "+" : ""}${rMultiple.toFixed(2)}R`,
+    );
+    if (profit < rDistance) continue;
+
+    try {
+      const result = await moveStopLoss(p.symbol, exitSide, entry);
+      console.log(
+        `  ✅ ${p.symbol}: SL → BE (algo ${result.oldAlgoId} → ${result.newAlgoId}, trigger $${result.newTrigger})`,
+      );
+      await sendTelegram([
+        `*Move-to-BE — ${p.symbol}* [🔴 LIVE]`,
+        ``,
+        `Profit reached *1R* — Stop Loss moved to entry.`,
+        `*Entry:* $${entry}`,
+        `*Old SL:* $${slPrice}`,
+        `*New SL:* $${result.newTrigger} (BE)`,
+        `*Mark:* $${mark}  (${rMultiple.toFixed(2)}R)`,
+      ].join("\n"));
+    } catch (err) {
+      const naked = /NAKED_POSITION/.test(err.message);
+      console.log(`  ❌ ${p.symbol}: SL move failed — ${err.message}`);
+      if (naked && typeof closePositionMarket === "function") {
+        console.log(`  🚨 ${p.symbol}: NAKED — emergency MARKET close…`);
+        try {
+          const closeRes = await closePositionMarket(p.symbol);
+          await sendTelegram([
+            `🚨 *NAKED POSITION — ${p.symbol}* [🔴 LIVE]`,
+            ``,
+            `Move-to-BE cancelled old SL but new SL placement failed.`,
+            `*Emergency close:* ✅ order \`${closeRes.orderId}\` (qty ${closeRes.quantity})`,
+          ].join("\n"));
+        } catch (closeErr) {
+          await sendTelegram([
+            `🚨 *MANUAL ACTION — ${p.symbol}* [🔴 LIVE]`,
+            ``,
+            `Move-to-BE failed AND emergency close failed.`,
+            `*Error:* \`${closeErr.message}\``,
+            ``,
+            `⚠️  Open Binance and flatten ${p.symbol} immediately.`,
+          ].join("\n"));
+        }
+      } else {
+        await sendTelegram(
+          `⚠️ *Move-to-BE failed — ${p.symbol}* [🔴 LIVE]\n\n\`${err.message}\``,
+        );
+      }
+    }
+  }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -642,10 +751,9 @@ async function processSymbol(symbol, timeframe, log) {
   }
 
   // Dynamic position sizing — shrink trade size by 20% per attempt if free
-  // margin is below required. With LEVERAGE=1 (default) margin == notional;
-  // higher leverage relaxes the margin requirement but we still target full
-  // notional in `tradeSize`, then derive margin from it.
-  const leverage = USE_FUTURES ? parseInt(process.env.LEVERAGE || "1", 10) : 1;
+  // margin is below required. tradeSize is the target notional; required
+  // margin = notional / leverage. Spot ignores leverage (=1).
+  const leverage = USE_FUTURES ? CONFIG.leverage : 1;
   let actualTradeSize = tradeSize;
   let preTradeShrinks = 0;
   if (!CONFIG.paperTrading && usdtBalance !== null && side) {
@@ -703,6 +811,24 @@ async function processSymbol(symbol, timeframe, log) {
     } catch (err) {
       console.log(`⚠️  Position check failed: ${err.message}`);
     }
+    // Aggregate exposure cap — sum of notional across all open positions
+    // must stay below TOTAL_EXPOSURE_LIMIT after adding the new entry.
+    try {
+      const allPositions = await getOpenPositions();
+      const currentExposure = allPositions.reduce(
+        (sum, p) => sum + Math.abs(p.positionAmt) * p.markPrice,
+        0,
+      );
+      const projected = currentExposure + actualTradeSize;
+      conditions.push({
+        pass: projected <= CONFIG.totalExposureLimit,
+        label: "Total exposure within limit",
+        required: `<= $${CONFIG.totalExposureLimit.toFixed(2)} aggregate notional`,
+        actual: `$${currentExposure.toFixed(2)} open + $${actualTradeSize.toFixed(2)} new = $${projected.toFixed(2)}`,
+      });
+    } catch (err) {
+      console.log(`⚠️  Exposure check failed: ${err.message}`);
+    }
     try {
       const funding = await checkFundingRate(symbol);
       const skipThreshold = parseFloat(process.env.SKIP_HIGH_FUNDING_RATE || "0.001");
@@ -741,6 +867,9 @@ async function processSymbol(symbol, timeframe, log) {
     const overlap = conditions.find(
       (c) => c.label === "No existing futures position on symbol" && !c.pass,
     );
+    const exposure = conditions.find(
+      (c) => c.label === "Total exposure within limit" && !c.pass,
+    );
     const funding = conditions.find(
       (c) => c.label === "Funding rate within tolerance" && !c.pass,
     );
@@ -748,6 +877,7 @@ async function processSymbol(symbol, timeframe, log) {
     else if (dup) blockReason = "DEDUP";
     else if (spotShort) blockReason = "SPOT_NO_SHORT";
     else if (overlap) blockReason = "POSITION_OVERLAP";
+    else if (exposure) blockReason = "EXPOSURE_LIMIT";
     else if (funding) blockReason = "HIGH_FUNDING";
     else blockReason = "STRATEGY";
   }
@@ -937,7 +1067,10 @@ async function run() {
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
   console.log(
-    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Broker: ${USE_FUTURES ? "FUTURES (1×)" : "SPOT"}`,
+    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Broker: ${USE_FUTURES ? `FUTURES (${CONFIG.leverage}×)` : "SPOT"}`,
+  );
+  console.log(
+    `  Trade size: $${CONFIG.maxTradeSizeUSD} | Exposure cap: $${CONFIG.totalExposureLimit}`,
   );
   console.log("═══════════════════════════════════════════════════════════");
 
@@ -981,18 +1114,21 @@ async function run() {
   // Futures-only: idempotent setup of leverage + margin type per symbol.
   // Spot's initSymbol is a no-op so this is safe to call unconditionally.
   if (USE_FUTURES && !CONFIG.paperTrading) {
-    const leverage = parseInt(process.env.LEVERAGE || "1", 10);
     const marginType = process.env.MARGIN_TYPE || "ISOLATED";
-    console.log(`\nFutures init: leverage=${leverage}× marginType=${marginType}`);
+    console.log(`\nFutures init: leverage=${CONFIG.leverage}× marginType=${marginType}`);
     for (const symbol of watchlist) {
       try {
-        await initSymbol(symbol, leverage, marginType);
+        await initSymbol(symbol, CONFIG.leverage, marginType);
         console.log(`  ✅ ${symbol} configured`);
       } catch (err) {
         console.log(`  ⚠️  ${symbol} init failed: ${err.message}`);
       }
     }
   }
+
+  // Run move-to-BE on every tick before evaluating new entries — keeps the
+  // SL on any open position trailing forward as profit accumulates.
+  await manageOpenPositions();
 
   const log = loadLog();
   const limits = checkTradeLimits();
