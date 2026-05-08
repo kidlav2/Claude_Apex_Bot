@@ -1,6 +1,8 @@
 .env
 *.log
 safety-check-log.json
+session_buffer.json
+screener_cache.json
 node_modules/
 
 # Trade execution logs — contain real order IDs, balances, broker history.

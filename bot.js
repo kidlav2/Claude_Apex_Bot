@@ -13,6 +13,7 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { execSync } from "child_process";
 import { STRATEGY, evaluateEntry, buildRationale, activeKillZone, minutesLeftInKillZone } from "./strategy.js";
+import { getOrBuildWatchlist } from "./screener.js";
 
 // Broker module is selected by env flag. Both modules export the same surface
 // so processSymbol() doesn't care which is loaded.
@@ -1113,13 +1114,38 @@ async function run() {
   }
 
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
-  const watchlist = Array.isArray(rules.watchlist) && rules.watchlist.length > 0
+  const staticWatchlist = Array.isArray(rules.watchlist) && rules.watchlist.length > 0
     ? rules.watchlist
     : [CONFIG.symbol];
   const timeframe = CONFIG.timeframe || rules.default_timeframe || "15m";
 
+  // Dynamic Screener — replaces the static watchlist for the current Kill
+  // Zone with up to 7 high-volatility USDT-perpetuals + anchors. Lazy-cached
+  // to screener_cache.json keyed by (date, killZone). Toggle with
+  // DYNAMIC_SCREENER=false to fall back to rules.json without code changes.
+  let watchlist = staticWatchlist;
+  let watchlistSource = "rules.json (static)";
+  if (process.env.DYNAMIC_SCREENER !== "false") {
+    const today = new Date().toISOString().slice(0, 10);
+    const screen = await getOrBuildWatchlist({ date: today, killZone });
+    if (screen && Array.isArray(screen.watchlist) && screen.watchlist.length > 0) {
+      watchlist = screen.watchlist;
+      watchlistSource = `dynamic-screener (${screen.source}, generated ${screen.generatedAt})`;
+      if (screen.picks && screen.picks.length > 0) {
+        console.log("\n📊 Dynamic Screener:");
+        for (const p of screen.picks) {
+          console.log(`   • ${p.symbol}  vol ${p.volPct.toFixed(2)}%  funding ${(p.fundingRate * 100).toFixed(3)}%`);
+        }
+      }
+    } else if (screen && screen.source === "error") {
+      console.log(`⚠️  Dynamic Screener error — fallback to static: ${screen.error}`);
+    } else {
+      console.log("⚠️  Dynamic Screener returned no symbols — fallback to static");
+    }
+  }
+
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Watchlist: ${watchlist.join(", ")} | Timeframe: ${timeframe}`);
+  console.log(`Watchlist (${watchlistSource}):\n  ${watchlist.join(", ")}\nTimeframe: ${timeframe}`);
 
   // Futures-only: idempotent setup of leverage + margin type per symbol.
   // Spot's initSymbol is a no-op so this is safe to call unconditionally.
