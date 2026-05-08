@@ -190,10 +190,11 @@ const STRATEGY = {
   // Sweep must be fresh — older liquidity grabs lose predictive value.
   // 15 LTF bars = 3.75h on 15m, well within current Kill Zone influence.
   maxSweepAgeBars: 15,
-  // 1.5R after empirical review — 100% of historical LIVE trades closed by
-  // Hard Time Stop short of a 2R TP. At 1.5R the TP sits inside the realized
-  // ~0.5–0.7% Kill-Zone moves, giving real fill chances vs. timer exits.
-  riskRewardRatio: 1.5,
+  // Take-profit multiple of risk. Default 1.5R after empirical review —
+  // 100% of historical LIVE trades closed by Hard Time Stop short of a 2R
+  // TP, while realized Kill-Zone moves were 0.28–0.70%. Tunable per env
+  // without code changes via RR_RATIO.
+  riskRewardRatio: parseFloat(process.env.RR_RATIO || "1.5"),
   maxDistancePctFromHtfEma: 1.5,
   atrPeriod: 14,
   atrSlBuffer: 0.5,

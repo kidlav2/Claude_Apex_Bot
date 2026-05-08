@@ -124,6 +124,11 @@ const MIN_TRADE_SIZE_USD = 5;
 const MARGIN_BUFFER = 1.05;
 const INSUFFICIENT_MARGIN_RE = /margin is insufficient|insufficient.*balance|insufficient.*margin/i;
 
+// Move-to-BE micro-buffer: lift SL slightly past entry so a triggered exit
+// covers exchange fees instead of fixing a wash. 0.1% on a $50 notional ≈
+// $0.05 — comfortably above 2× taker fees on USDS-M futures (~0.08%).
+const BE_BUFFER_PCT = 0.001;
+
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 function loadLog() {
@@ -633,23 +638,28 @@ async function manageOpenPositions() {
     const rDistance = isLong ? entry - slPrice : slPrice - entry;
     const profit = isLong ? mark - entry : entry - mark;
     const rMultiple = rDistance > 0 ? profit / rDistance : 0;
+    // Lift SL slightly past entry so a flush-back exit covers fees + slippage
+    // and lands at small net plus rather than zero.
+    const beTarget = isLong
+      ? entry * (1 + BE_BUFFER_PCT)
+      : entry * (1 - BE_BUFFER_PCT);
     console.log(
       `  ${p.symbol}: entry $${entry} mark $${mark} SL $${slPrice} → ${rMultiple >= 0 ? "+" : ""}${rMultiple.toFixed(2)}R`,
     );
     if (profit < rDistance) continue;
 
     try {
-      const result = await moveStopLoss(p.symbol, exitSide, entry);
+      const result = await moveStopLoss(p.symbol, exitSide, beTarget);
       console.log(
-        `  ✅ ${p.symbol}: SL → BE (algo ${result.oldAlgoId} → ${result.newAlgoId}, trigger $${result.newTrigger})`,
+        `  ✅ ${p.symbol}: SL → BE+${(BE_BUFFER_PCT * 100).toFixed(2)}% (algo ${result.oldAlgoId} → ${result.newAlgoId}, trigger $${result.newTrigger})`,
       );
       await sendTelegram([
         `*Move-to-BE — ${p.symbol}* [🔴 LIVE]`,
         ``,
-        `Profit reached *1R* — Stop Loss moved to entry.`,
+        `Profit reached *1R* — Stop Loss moved past entry by ${(BE_BUFFER_PCT * 100).toFixed(2)}% (covers fees).`,
         `*Entry:* $${entry}`,
         `*Old SL:* $${slPrice}`,
-        `*New SL:* $${result.newTrigger} (BE)`,
+        `*New SL:* $${result.newTrigger}  (BE${isLong ? "+" : "−"}${(BE_BUFFER_PCT * 100).toFixed(2)}%)`,
         `*Mark:* $${mark}  (${rMultiple.toFixed(2)}R)`,
       ].join("\n"));
     } catch (err) {
