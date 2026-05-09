@@ -1,12 +1,14 @@
 /**
  * ICT Silver Bullet — strategy module.
  *
- * Three time-of-day windows (Kill Zones, New York time):
- *   - London SB  03:00–04:00 NY  → 07:00–08:00 UTC (EDT, UTC-4) / 08:00–09:00 UTC (EST, UTC-5)
- *   - AM SB      10:00–11:00 NY  → 14:00–15:00 UTC (EDT) / 15:00–16:00 UTC (EST)
- *   - PM SB      14:00–15:00 NY  → 18:00–19:00 UTC (EDT) / 19:00–20:00 UTC (EST)
+ * Five time-of-day windows (Kill Zones):
+ *   - Asia      01:00–02:00 UTC  (fixed UTC)
+ *   - Midnight  04:00–05:00 UTC  (fixed UTC)
+ *   - London SB 03:00–04:00 NY  → 07:00–08:00 UTC (EDT, UTC-4) / 08:00–09:00 UTC (EST, UTC-5)
+ *   - AM SB     10:00–11:00 NY  → 14:00–15:00 UTC (EDT) / 15:00–16:00 UTC (EST)
+ *   - PM SB     14:00–15:00 NY  → 18:00–19:00 UTC (EDT) / 19:00–20:00 UTC (EST)
  *
- * Timezone is handled via Intl.DateTimeFormat("America/New_York") — DST is automatic.
+ * Asia and Midnight use fixed UTC hours; London/AM/PM use America/New_York via Intl.
  *
  * Entry logic (per kill zone):
  *   1. We must be inside an active kill zone.
@@ -37,6 +39,9 @@ function nyMinute(date = new Date()) {
 }
 
 function activeKillZone(date = new Date()) {
+  const utcH = date.getUTCHours();
+  if (utcH === 1) return "Asia";
+  if (utcH === 4) return "Midnight";
   const h = nyHour(date);
   if (h === 3) return "London";
   if (h === 10) return "AM";
