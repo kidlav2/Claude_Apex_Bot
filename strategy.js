@@ -1,14 +1,17 @@
 /**
  * ICT Silver Bullet — strategy module.
  *
- * Five time-of-day windows (Kill Zones):
+ * Seven time-of-day windows (Kill Zones):
+ *   - DailyOpen 00:00–01:00 UTC  (fixed UTC, BTC daily session change)
  *   - Asia      01:00–02:00 UTC  (fixed UTC)
  *   - Midnight  04:00–05:00 UTC  (fixed UTC)
+ *   - Frankfurt 06:00–07:00 UTC  (fixed UTC, pre-London EU institutionals)
  *   - London SB 03:00–04:00 NY  → 07:00–08:00 UTC (EDT, UTC-4) / 08:00–09:00 UTC (EST, UTC-5)
  *   - AM SB     10:00–11:00 NY  → 14:00–15:00 UTC (EDT) / 15:00–16:00 UTC (EST)
  *   - PM SB     14:00–15:00 NY  → 18:00–19:00 UTC (EDT) / 19:00–20:00 UTC (EST)
  *
- * Asia and Midnight use fixed UTC hours; London/AM/PM use America/New_York via Intl.
+ * UTC-anchored zones (DailyOpen/Asia/Midnight/Frankfurt) use date.getUTCHours();
+ * London/AM/PM use America/New_York via Intl (DST is automatic).
  *
  * Entry logic (per kill zone):
  *   1. We must be inside an active kill zone.
@@ -40,8 +43,10 @@ function nyMinute(date = new Date()) {
 
 function activeKillZone(date = new Date()) {
   const utcH = date.getUTCHours();
+  if (utcH === 0) return "DailyOpen";
   if (utcH === 1) return "Asia";
   if (utcH === 4) return "Midnight";
+  if (utcH === 6) return "Frankfurt";
   const h = nyHour(date);
   if (h === 3) return "London";
   if (h === 10) return "AM";
@@ -183,6 +188,154 @@ function isStructureAgainstBias(htfCandles, bias, swings = 3) {
   return true;
 }
 
+// ─── Market health filter ───────────────────────────────────────────────────
+// "Bad market" gate. Three orthogonal checks against a 7-day baseline of LTF
+// bars (15m → 672 bars). All ratios are tunable via env without code changes.
+//   (a) Volatility floor — current ATR(14) / 7d-median rolling ATR(14)
+//   (b) Volume floor      — last 2h volume sum / 7d-median rolling 2h sum
+//   (c) Range expansion   — last 1h high-low / current ATR(14)
+// Catches weekend doldrums, holiday markets, intra-session flat spots that
+// historically degrade Silver Bullet win-rate.
+
+const HEALTH = {
+  baselineBars: parseInt(process.env.HEALTH_BASELINE_BARS || "672", 10), // 7d × 96 (15m)
+  atrFloorRatio: parseFloat(process.env.HEALTH_ATR_FLOOR || "0.5"),
+  volWindowBars: parseInt(process.env.HEALTH_VOL_WINDOW || "8", 10),     // 2h on 15m
+  volFloorRatio: parseFloat(process.env.HEALTH_VOL_FLOOR || "0.6"),
+  rangeWindowBars: parseInt(process.env.HEALTH_RANGE_WINDOW || "4", 10), // 1h on 15m
+  rangeFloorRatio: parseFloat(process.env.HEALTH_RANGE_FLOOR || "0.3"),
+};
+
+function trSeries(candles) {
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs.push(Math.max(
+      c.high - c.low,
+      Math.abs(c.high - p.close),
+      Math.abs(c.low - p.close),
+    ));
+  }
+  return trs;
+}
+
+function rollingMean(values, window) {
+  if (values.length < window) return [];
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < window; i++) sum += values[i];
+  out.push(sum / window);
+  for (let i = window; i < values.length; i++) {
+    sum += values[i] - values[i - window];
+    out.push(sum / window);
+  }
+  return out;
+}
+
+function rollingSum(values, window) {
+  if (values.length < window) return [];
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < window; i++) sum += values[i];
+  out.push(sum);
+  for (let i = window; i < values.length; i++) {
+    sum += values[i] - values[i - window];
+    out.push(sum);
+  }
+  return out;
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+// Returns an array of condition objects in the same shape as evaluateBars'
+// `check()` calls, so they can be appended to the main results list.
+// Fail-open on insufficient history (logged with explicit "n/a (X/Y)" actual)
+// — keeps backtests on short histories functional without silent gating.
+function marketHealthCheck(ltfCandles, currentAtr, period) {
+  const out = [];
+  const baselineNeed = HEALTH.baselineBars + period;
+
+  // (a) Volatility floor — current ATR vs 7d median ATR
+  if (currentAtr !== null && ltfCandles.length >= baselineNeed) {
+    const slice = ltfCandles.slice(-baselineNeed);
+    const trs = trSeries(slice);
+    const atrRoll = rollingMean(trs, period);
+    const baselineAtr = median(atrRoll);
+    const ratio = baselineAtr ? currentAtr / baselineAtr : null;
+    out.push({
+      label: "Volatility floor (ATR vs 7d median)",
+      required: `>= ${HEALTH.atrFloorRatio.toFixed(2)}× baseline`,
+      actual: ratio !== null
+        ? `${ratio.toFixed(2)}× (atr=${currentAtr.toFixed(4)}, base=${baselineAtr.toFixed(4)})`
+        : "n/a",
+      pass: ratio !== null && ratio >= HEALTH.atrFloorRatio,
+    });
+  } else {
+    out.push({
+      label: "Volatility floor (ATR vs 7d median)",
+      required: `>= ${HEALTH.atrFloorRatio.toFixed(2)}× baseline`,
+      actual: `n/a (insufficient history ${ltfCandles.length}/${baselineNeed})`,
+      pass: true,
+    });
+  }
+
+  // (b) Volume floor — current 2h volume vs 7d median rolling 2h volume
+  if (ltfCandles.length >= HEALTH.baselineBars) {
+    const slice = ltfCandles.slice(-HEALTH.baselineBars);
+    const vols = slice.map((c) => c.volume);
+    const sums = rollingSum(vols, HEALTH.volWindowBars);
+    const baselineVol = median(sums);
+    const currentVol = vols.slice(-HEALTH.volWindowBars).reduce((a, b) => a + b, 0);
+    const ratio = baselineVol ? currentVol / baselineVol : null;
+    out.push({
+      label: "Volume floor (2h vs 7d median)",
+      required: `>= ${HEALTH.volFloorRatio.toFixed(2)}× baseline`,
+      actual: ratio !== null ? `${ratio.toFixed(2)}×` : "n/a",
+      pass: ratio !== null && ratio >= HEALTH.volFloorRatio,
+    });
+  } else {
+    out.push({
+      label: "Volume floor (2h vs 7d median)",
+      required: `>= ${HEALTH.volFloorRatio.toFixed(2)}× baseline`,
+      actual: `n/a (insufficient history ${ltfCandles.length}/${HEALTH.baselineBars})`,
+      pass: true,
+    });
+  }
+
+  // (c) Range expansion — last 1h high-low vs current ATR
+  if (currentAtr !== null && ltfCandles.length >= HEALTH.rangeWindowBars) {
+    const window = ltfCandles.slice(-HEALTH.rangeWindowBars);
+    const hi = Math.max(...window.map((c) => c.high));
+    const lo = Math.min(...window.map((c) => c.low));
+    const range = hi - lo;
+    const ratio = currentAtr > 0 ? range / currentAtr : null;
+    out.push({
+      label: "Range expansion (1h range vs ATR)",
+      required: `>= ${HEALTH.rangeFloorRatio.toFixed(2)}× ATR`,
+      actual: ratio !== null
+        ? `${ratio.toFixed(2)}× (range=${range.toFixed(4)})`
+        : "n/a",
+      pass: ratio !== null && ratio >= HEALTH.rangeFloorRatio,
+    });
+  } else {
+    out.push({
+      label: "Range expansion (1h range vs ATR)",
+      required: `>= ${HEALTH.rangeFloorRatio.toFixed(2)}× ATR`,
+      actual: "n/a",
+      pass: true,
+    });
+  }
+
+  return out;
+}
+
 // ─── Strategy evaluation ─────────────────────────────────────────────────────
 
 const STRATEGY = {
@@ -237,10 +390,16 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
 
   check(
     "Active Silver Bullet kill zone",
-    "London / AM / PM",
+    "DailyOpen / Asia / Midnight / Frankfurt / London / AM / PM",
     killZone || "none",
     Boolean(killZone),
   );
+
+  // Market-health gate — blocks entries during dead/flat markets (weekends,
+  // holidays, intra-session lulls). Three checks vs 7d baseline.
+  for (const c of marketHealthCheck(ltfCandles, atrValue, STRATEGY.atrPeriod)) {
+    results.push(c);
+  }
 
   check(
     `HTF bias from EMA(${STRATEGY.htfEmaPeriod}) on ${STRATEGY.htfTimeframe}`,
@@ -398,7 +557,9 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
 }
 
 async function evaluateEntry({ symbol, timeframe }) {
-  const ltfCandles = await fetchCandles(symbol, timeframe, 300);
+  // 750 bars on 15m ≈ 7.8 days — enough for the marketHealthCheck baseline
+  // (HEALTH.baselineBars + STRATEGY.atrPeriod = 686). Binance allows 1500/req.
+  const ltfCandles = await fetchCandles(symbol, timeframe, 750);
   const htfCandles = await fetchCandles(symbol, STRATEGY.htfTimeframe, 200);
   const dailyCandles = await fetchCandles(symbol, "1D", 30);
   const killZone = activeKillZone();
@@ -441,4 +602,10 @@ function buildRationale(evalResult) {
     .join("\n");
 }
 
-export { STRATEGY, fetchCandles, evaluateEntry, evaluateBars, buildRationale, activeKillZone, minutesLeftInKillZone };
+export {
+  STRATEGY, HEALTH,
+  fetchCandles,
+  evaluateEntry, evaluateBars, buildRationale,
+  activeKillZone, minutesLeftInKillZone,
+  marketHealthCheck,
+};

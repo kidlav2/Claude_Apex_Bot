@@ -1345,20 +1345,20 @@ function appendCloseRow({ symbol, exitSide, qty, markPrice, unrealizedPnl, order
   console.log(`   Tax record saved → ${CSV_FILE}`);
 }
 
-// CLI: `node bot.js --screen [London|AM|PM|Asia|Midnight]` — manually warm screener_cache.json
-// Useful as a pre-Kill-Zone cron (e.g. 09:55 NY for the AM session) so the
-// first in-zone tick reads cache instead of paying ~1.5s on Binance API.
+// CLI: `node bot.js --screen [London|AM|PM|Asia|Midnight|DailyOpen|Frankfurt]`
+// Manually warm screener_cache.json as a pre-Kill-Zone cron (e.g. 09:55 NY for
+// AM) so the first in-zone tick reads cache instead of paying ~1.5s on Binance.
 async function warmScreener() {
   const idx = process.argv.indexOf("--screen");
   const zoneArg = process.argv[idx + 1];
-  const isZone = zoneArg && /^(London|AM|PM|Asia|Midnight)$/i.test(zoneArg);
-  const explicitZone = isZone
-    ? (zoneArg[0].toUpperCase() + zoneArg.slice(1).toLowerCase()).replace("Pm", "PM").replace("Am", "AM")
+  const ZONE_NAMES = ["London", "AM", "PM", "Asia", "Midnight", "DailyOpen", "Frankfurt"];
+  const explicitZone = zoneArg
+    ? ZONE_NAMES.find((n) => n.toLowerCase() === zoneArg.toLowerCase()) || null
     : null;
   const killZone = explicitZone || activeKillZone();
   if (!killZone) {
     console.error("⚠️  No active Kill Zone and no zone specified.");
-    console.error("Usage: node bot.js --screen [London|AM|PM|Asia|Midnight]");
+    console.error(`Usage: node bot.js --screen [${ZONE_NAMES.join("|")}]`);
     process.exit(1);
   }
   const today = new Date().toISOString().slice(0, 10);
