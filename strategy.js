@@ -73,13 +73,33 @@ const BINANCE_INTERVAL = {
   "1D": "1d",
 };
 
+const FETCH_TIMEOUT_MS = parseInt(process.env.BINANCE_FETCH_TIMEOUT_MS || "10000", 10);
+
+async function fetchWithTimeout(url, options = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function fetchCandles(symbol, interval, limit = 500) {
   const binanceInterval = BINANCE_INTERVAL[interval] || interval.toLowerCase();
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-  const res = await fetch(url);
+  let res;
+  try {
+    res = await fetchWithTimeout(url);
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Binance klines ${symbol} ${interval} timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
   const data = await res.json();
-  return data.map((k) => ({
+  const out = data.map((k) => ({
     time: k[0],
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
@@ -87,6 +107,19 @@ async function fetchCandles(symbol, interval, limit = 500) {
     close: parseFloat(k[4]),
     volume: parseFloat(k[5]),
   }));
+  // Fail fast on bad candle data — NaN OHLC silently poisons every indicator
+  // (EMA, ATR, FVG detection) and produces garbage signals. Throwing here
+  // pushes the symbol into the catch in run()'s for-loop, which logs and
+  // moves on to the next symbol.
+  const bad = out.find(
+    (c) =>
+      !Number.isFinite(c.open) ||
+      !Number.isFinite(c.high) ||
+      !Number.isFinite(c.low) ||
+      !Number.isFinite(c.close),
+  );
+  if (bad) throw new Error(`Bad candle for ${symbol} ${interval}: ${JSON.stringify(bad)}`);
+  return out;
 }
 
 // ─── Indicators ──────────────────────────────────────────────────────────────
@@ -256,9 +289,13 @@ function median(values) {
 
 // Returns an array of condition objects in the same shape as evaluateBars'
 // `check()` calls, so they can be appended to the main results list.
-// Fail-open on insufficient history (logged with explicit "n/a (X/Y)" actual)
-// — keeps backtests on short histories functional without silent gating.
-function marketHealthCheck(ltfCandles, currentAtr, period) {
+//
+// Insufficient-history fallbacks default to fail-open so backtests on short
+// histories still produce signals. Live runtime passes `failClosed: true`
+// (H5) so a fresh container or a new screener-added symbol can't slip a
+// trade through with no baseline computed — blocks until history fills in.
+function marketHealthCheck(ltfCandles, currentAtr, period, options = {}) {
+  const failClosed = options.failClosed === true;
   const out = [];
   const baselineNeed = HEALTH.baselineBars + period;
 
@@ -281,8 +318,8 @@ function marketHealthCheck(ltfCandles, currentAtr, period) {
     out.push({
       label: "Volatility floor (ATR vs 7d median)",
       required: `>= ${HEALTH.atrFloorRatio.toFixed(2)}× baseline`,
-      actual: `n/a (insufficient history ${ltfCandles.length}/${baselineNeed})`,
-      pass: true,
+      actual: `n/a (insufficient history ${ltfCandles.length}/${baselineNeed})${failClosed ? " — fail-closed in live" : ""}`,
+      pass: !failClosed,
     });
   }
 
@@ -304,8 +341,8 @@ function marketHealthCheck(ltfCandles, currentAtr, period) {
     out.push({
       label: "Volume floor (2h vs 7d median)",
       required: `>= ${HEALTH.volFloorRatio.toFixed(2)}× baseline`,
-      actual: `n/a (insufficient history ${ltfCandles.length}/${HEALTH.baselineBars})`,
-      pass: true,
+      actual: `n/a (insufficient history ${ltfCandles.length}/${HEALTH.baselineBars})${failClosed ? " — fail-closed in live" : ""}`,
+      pass: !failClosed,
     });
   }
 
@@ -328,8 +365,8 @@ function marketHealthCheck(ltfCandles, currentAtr, period) {
     out.push({
       label: "Range expansion (1h range vs ATR)",
       required: `>= ${HEALTH.rangeFloorRatio.toFixed(2)}× ATR`,
-      actual: "n/a",
-      pass: true,
+      actual: `n/a${failClosed ? " — fail-closed in live" : ""}`,
+      pass: !failClosed,
     });
   }
 
@@ -365,22 +402,37 @@ const STRATEGY = {
 
 // Pure evaluation — operates on already-fetched bars. Used by both live bot
 // (via evaluateEntry wrapper) and backtest (which slices historical bars).
-function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
+function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClosed = false }) {
+  // Live "now" price — used for sizing, distance-to-EMA, SL/TP math, and
+  // logging. The forming bar's close is volatile but it's the best estimate
+  // of the market price right at decision time.
   const price = ltfCandles[ltfCandles.length - 1].close;
-  const htfEmaArr = emaSeries(htfCandles.map((c) => c.close), STRATEGY.htfEmaPeriod);
+
+  // Closed-only views (H3 fix). The forming bar's OHLC mutates every tick,
+  // so a flickering FVG/sweep can pass the gate at xx:14 then disappear at
+  // xx:15 when the candle closes elsewhere. All indicators and pattern
+  // detection use *closed* bars. Only `price` and the bias comparison
+  // (live-price vs closed-EMA) keep the live reference.
+  const closedLtf = ltfCandles.slice(0, -1);
+  const closedHtf = htfCandles.slice(0, -1);
+  const closedDaily = dailyCandles.slice(0, -1);
+
+  const htfEmaArr = emaSeries(closedHtf.map((c) => c.close), STRATEGY.htfEmaPeriod);
   const htfEma = htfEmaArr.length ? htfEmaArr[htfEmaArr.length - 1] : null;
   const htfEmaPrev = htfEmaArr.length >= 2 ? htfEmaArr[htfEmaArr.length - 2] : null;
   const emaSlope = htfEma !== null && htfEmaPrev !== null ? htfEma - htfEmaPrev : null;
-  const atrValue = atr(ltfCandles, STRATEGY.atrPeriod);
+  const atrValue = atr(closedLtf, STRATEGY.atrPeriod);
 
-  // PDH / PDL from previous completed daily candle
-  const prevDay = dailyCandles.length >= 2 ? dailyCandles[dailyCandles.length - 2] : null;
+  // PDH / PDL from previous closed daily candle. Equivalent to the previous
+  // dailyCandles[length - 2] (skip the forming day) but now expressed via
+  // closedDaily for consistency with the rest of the closed-only view.
+  const prevDay = closedDaily.length >= 1 ? closedDaily[closedDaily.length - 1] : null;
   const pdh = prevDay ? prevDay.high : null;
   const pdl = prevDay ? prevDay.low : null;
 
   const bias = htfEma ? (price > htfEma ? "long" : "short") : null;
-  const fvg = bias ? findRecentFVG(ltfCandles, bias, STRATEGY.fvgLookbackBars) : null;
-  const sweep = findRecentSweep(ltfCandles, bias, pdh, pdl, STRATEGY.sweepLookbackBars);
+  const fvg = bias ? findRecentFVG(closedLtf, bias, STRATEGY.fvgLookbackBars) : null;
+  const sweep = findRecentSweep(closedLtf, bias, pdh, pdl, STRATEGY.sweepLookbackBars);
   const distancePct = htfEma ? Math.abs((price - htfEma) / htfEma) * 100 : null;
 
   const results = [];
@@ -396,8 +448,10 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
   );
 
   // Market-health gate — blocks entries during dead/flat markets (weekends,
-  // holidays, intra-session lulls). Three checks vs 7d baseline.
-  for (const c of marketHealthCheck(ltfCandles, atrValue, STRATEGY.atrPeriod)) {
+  // holidays, intra-session lulls). Three checks vs 7d baseline. The
+  // failClosed flag (true in live runtime, false in backtest) decides what
+  // to do on insufficient history; see marketHealthCheck for details.
+  for (const c of marketHealthCheck(closedLtf, atrValue, STRATEGY.atrPeriod, { failClosed })) {
     results.push(c);
   }
 
@@ -440,7 +494,7 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
   // and short setups when it's printing Higher Lows. Even a valid local FVG
   // shouldn't override a HTF rollover (08.05 BTC: long FVG into a 4-day series
   // of lower daily highs).
-  const structureAgainst = isStructureAgainstBias(htfCandles, bias, STRATEGY.htfStructureSwings);
+  const structureAgainst = isStructureAgainstBias(closedHtf, bias, STRATEGY.htfStructureSwings);
   check(
     "HTF structure not against bias",
     bias === "long"
@@ -468,7 +522,7 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
   );
 
   // Daily EMA(20) trend filter — block counter-trend setups vs daily direction
-  const dailyEmaArr = emaSeries(dailyCandles.map((c) => c.close), STRATEGY.dailyEmaPeriod);
+  const dailyEmaArr = emaSeries(closedDaily.map((c) => c.close), STRATEGY.dailyEmaPeriod);
   const dailyEma = dailyEmaArr.length ? dailyEmaArr[dailyEmaArr.length - 1] : null;
   const dailyEmaPrev = dailyEmaArr.length >= 2 ? dailyEmaArr[dailyEmaArr.length - 2] : null;
   const dailySlope = dailyEma !== null && dailyEmaPrev !== null ? dailyEma - dailyEmaPrev : null;
@@ -487,7 +541,7 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone }) {
   );
 
   // LTF EMA(20) slope — intra-session momentum confirmation
-  const ltfEmaArr = emaSeries(ltfCandles.map((c) => c.close), STRATEGY.ltfEmaPeriod);
+  const ltfEmaArr = emaSeries(closedLtf.map((c) => c.close), STRATEGY.ltfEmaPeriod);
   const ltfEma = ltfEmaArr.length ? ltfEmaArr[ltfEmaArr.length - 1] : null;
   const ltfEmaPrev = ltfEmaArr.length >= 2 ? ltfEmaArr[ltfEmaArr.length - 2] : null;
   const ltfSlope = ltfEma !== null && ltfEmaPrev !== null ? ltfEma - ltfEmaPrev : null;
@@ -563,7 +617,11 @@ async function evaluateEntry({ symbol, timeframe }) {
   const htfCandles = await fetchCandles(symbol, STRATEGY.htfTimeframe, 200);
   const dailyCandles = await fetchCandles(symbol, "1D", 30);
   const killZone = activeKillZone();
-  return evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone });
+  // Live runtime: fail-closed on insufficient history only when real money is
+  // on the line. Paper keeps the fail-open default so dry-runs on newly-listed
+  // or screener-added symbols still produce diagnostic signals.
+  const failClosed = process.env.PAPER_TRADING === "false";
+  return evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClosed });
 }
 
 function buildRationale(evalResult) {

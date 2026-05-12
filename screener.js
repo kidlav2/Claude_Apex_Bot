@@ -50,10 +50,24 @@ const CACHE_FILE = "screener_cache.json";
 
 // ─── HTTP helpers ───────────────────────────────────────────────────────────
 
+const FETCH_TIMEOUT_MS = parseInt(process.env.BINANCE_FETCH_TIMEOUT_MS || "10000", 10);
+
 async function publicGet(path, params = {}) {
   const qs = new URLSearchParams(params).toString();
   const url = `${FUTURES_BASE}${path}${qs ? `?${qs}` : ""}`;
-  const res = await fetch(url);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, { signal: ctrl.signal });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Binance ${path} timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(t);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Binance ${path} ${res.status}: ${text.slice(0, 200)}`);
@@ -275,4 +289,66 @@ async function getOrBuildWatchlist({ date, killZone, forceRebuild = false }) {
   }
 }
 
-export { buildDynamicWatchlist, getOrBuildWatchlist, SCREENER };
+// ─── Per-tick revalidation (H7) ─────────────────────────────────────────────
+//
+// Cache is keyed by (date, killZone) → same watchlist used for the full
+// 60-minute window. If a symbol pumps/dumps past SCREENER_MAX_DAILY_CHANGE
+// mid-zone, or 24h-volume drops below the floor, the cached entry is stale
+// even though the cache TTL hasn't expired. This runs a quick eligibility
+// re-check against the live /ticker/24hr snapshot at the start of each tick
+// and drops symbols that no longer pass. Anchors are exempt (BTC/ETH are
+// always tradeable; we don't want to drop them on a transient volume dip).
+//
+// One batch call covers all symbols at once. Returns { valid, dropped } so
+// the caller can log dropped picks with reasons.
+async function revalidateWatchlist(symbols) {
+  if (!Array.isArray(symbols) || symbols.length === 0) {
+    return { valid: [], dropped: [] };
+  }
+  const tickers = await publicGet("/fapi/v1/ticker/24hr");
+  const byName = new Map();
+  for (const t of tickers) byName.set(t.symbol, t);
+
+  const anchorSet = new Set(SCREENER.anchors);
+  const valid = [];
+  const dropped = [];
+  for (const sym of symbols) {
+    if (anchorSet.has(sym)) {
+      valid.push(sym);
+      continue;
+    }
+    const t = byName.get(sym);
+    if (!t) {
+      dropped.push({ symbol: sym, reason: "no ticker data" });
+      continue;
+    }
+    const vol = parseFloat(t.quoteVolume);
+    const chg = Math.abs(parseFloat(t.priceChangePercent));
+    const price = parseFloat(t.lastPrice);
+    if (!Number.isFinite(vol) || vol < SCREENER.minQuoteVolume24h) {
+      dropped.push({
+        symbol: sym,
+        reason: `volume $${(vol / 1e6).toFixed(1)}M < min $${(SCREENER.minQuoteVolume24h / 1e6).toFixed(1)}M`,
+      });
+      continue;
+    }
+    if (!Number.isFinite(chg) || chg > SCREENER.maxAbsPriceChangePct24h) {
+      dropped.push({
+        symbol: sym,
+        reason: `24h change ${chg.toFixed(2)}% > max ${SCREENER.maxAbsPriceChangePct24h}%`,
+      });
+      continue;
+    }
+    if (!Number.isFinite(price) || price < SCREENER.minPrice) {
+      dropped.push({
+        symbol: sym,
+        reason: `price $${price} < min $${SCREENER.minPrice}`,
+      });
+      continue;
+    }
+    valid.push(sym);
+  }
+  return { valid, dropped };
+}
+
+export { buildDynamicWatchlist, getOrBuildWatchlist, revalidateWatchlist, SCREENER };

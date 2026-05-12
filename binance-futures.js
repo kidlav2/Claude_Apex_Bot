@@ -33,6 +33,35 @@ const config = {
   baseUrl: isTestnet ? FUTURES_TESTNET : FUTURES_BASE,
 };
 
+// Numeric guards. Binance occasionally returns "null"/undefined fields during
+// transient API issues or maintenance windows. parseFloat → NaN silently
+// poisons every downstream comparison (NaN < X = false, NaN >= X = false),
+// which can both block valid trades and miss invalid ones. numRequired throws
+// at the boundary so the caller's try/catch fails fast with context.
+function num(x, fallback = null) {
+  const n = typeof x === "number" ? x : parseFloat(x);
+  return Number.isFinite(n) ? n : fallback;
+}
+function numRequired(x, field) {
+  const n = num(x);
+  if (n === null) throw new Error(`Invalid numeric '${field}': ${JSON.stringify(x)}`);
+  return n;
+}
+
+// fetch with timeout. Without it, a stuck Binance connection holds the bot
+// process open past the next cron tick. 10s is well above typical Binance
+// latency (~100ms) but tight enough to detect outages quickly.
+const FETCH_TIMEOUT_MS = parseInt(process.env.BINANCE_FETCH_TIMEOUT_MS || "10000", 10);
+async function fetchWithTimeout(url, options = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 function sign(query) {
   return crypto.createHmac("sha256", config.secretKey).update(query).digest("hex");
 }
@@ -45,10 +74,18 @@ async function signedRequest(method, path, params = {}) {
   });
   allParams.append("signature", sign(allParams.toString()));
   const url = `${config.baseUrl}${path}?${allParams.toString()}`;
-  const res = await fetch(url, {
-    method,
-    headers: { "X-MBX-APIKEY": config.apiKey },
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(url, {
+      method,
+      headers: { "X-MBX-APIKEY": config.apiKey },
+    });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Futures ${method} ${path} timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const data = await res.json();
   if (!res.ok) {
     throw new Error(`Futures ${method} ${path} failed: ${data.msg || data.code || res.status}`);
@@ -59,7 +96,15 @@ async function signedRequest(method, path, params = {}) {
 async function publicRequest(path, params = {}) {
   const qs = new URLSearchParams(params).toString();
   const url = `${config.baseUrl}${path}${qs ? `?${qs}` : ""}`;
-  const res = await fetch(url);
+  let res;
+  try {
+    res = await fetchWithTimeout(url);
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Futures GET ${path} timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const data = await res.json();
   if (!res.ok) {
     throw new Error(`Futures GET ${path} failed: ${data.msg || res.status}`);
@@ -96,11 +141,11 @@ async function getSymbolFilters(symbol) {
   const priceFilter = info.filters.find((f) => f.filterType === "PRICE_FILTER");
   const minNotional = info.filters.find((f) => f.filterType === "MIN_NOTIONAL");
   return {
-    stepSize: parseFloat(lotSize.stepSize),
-    minQty: parseFloat(lotSize.minQty),
-    tickSize: parseFloat(priceFilter.tickSize),
-    minPrice: parseFloat(priceFilter.minPrice),
-    minNotional: minNotional ? parseFloat(minNotional.notional) : 5,
+    stepSize: numRequired(lotSize.stepSize, "stepSize"),
+    minQty: numRequired(lotSize.minQty, "minQty"),
+    tickSize: numRequired(priceFilter.tickSize, "tickSize"),
+    minPrice: numRequired(priceFilter.minPrice, "minPrice"),
+    minNotional: minNotional ? num(minNotional.notional, 5) : 5,
     quantityPrecision: info.quantityPrecision,
     pricePrecision: info.pricePrecision,
   };
@@ -112,26 +157,34 @@ async function getBalanceUSDT() {
   if (!config.apiKey || !config.secretKey) return null;
   const data = await signedRequest("GET", "/fapi/v2/balance");
   const usdt = data.find((b) => b.asset === "USDT");
-  return usdt ? parseFloat(usdt.availableBalance) : 0;
+  if (!usdt) return 0;
+  return numRequired(usdt.availableBalance, "availableBalance");
 }
 
 // ─── Positions / Orders ────────────────────────────────────────────────────
 
-// Returns currently-open positions with non-zero qty (for overlap check)
+// Returns currently-open positions with non-zero qty (for overlap check).
+// Throws on bad numeric fields rather than returning NaN-poisoned objects —
+// downstream comparisons (exposure cap, BE distance, etc.) silently flip the
+// wrong way on NaN inputs.
 async function getOpenPositions(symbol = null) {
   const data = await signedRequest("GET", "/fapi/v2/positionRisk", symbol ? { symbol } : {});
-  return data
-    .filter((p) => parseFloat(p.positionAmt) !== 0)
-    .map((p) => ({
+  const out = [];
+  for (const p of data) {
+    const amt = num(p.positionAmt);
+    if (amt === null || amt === 0) continue;
+    out.push({
       symbol: p.symbol,
-      positionAmt: parseFloat(p.positionAmt),
-      entryPrice: parseFloat(p.entryPrice),
-      markPrice: parseFloat(p.markPrice),
-      unrealizedProfit: parseFloat(p.unRealizedProfit),
-      leverage: parseInt(p.leverage),
+      positionAmt: amt,
+      entryPrice: numRequired(p.entryPrice, "entryPrice"),
+      markPrice: numRequired(p.markPrice, "markPrice"),
+      unrealizedProfit: numRequired(p.unRealizedProfit, "unrealizedProfit"),
+      leverage: num(p.leverage, 1),
       marginType: p.marginType,
       updateTime: Number(p.updateTime) || 0,
-    }));
+    });
+  }
+  return out;
 }
 
 async function getOpenOrders(symbol = null) {
@@ -182,7 +235,7 @@ async function placeBinanceOrder(symbol, side, sizeUSD, options = {}) {
   const filters = await getSymbolFilters(symbol);
   // Get current mark price to compute qty (futures doesn't accept quoteOrderQty)
   const ticker = await publicRequest("/fapi/v1/ticker/price", { symbol });
-  const price = parseFloat(ticker.price);
+  const price = numRequired(ticker.price, "ticker.price");
   const rawQty = sizeUSD / price;
   // Round UP so the actual notional is >= sizeUSD (avoids MIN_NOTIONAL miss
   // when sizeUSD is just slightly above the minimum).
@@ -318,25 +371,90 @@ async function moveStopLoss(symbol, exitSide, newStopPrice) {
 
 // ─── Exit / flatten ─────────────────────────────────────────────────────────
 
-// Closes the current position with a MARKET reduceOnly order using the exact
-// positionAmt — avoids the formatStepUp overshoot that placeBinanceOrder uses
-// for entries (which would leave a small opposite-side residue when flattening).
-async function closePositionMarket(symbol) {
-  const positions = await getOpenPositions(symbol);
-  const pos = positions.find((p) => p.symbol === symbol);
-  if (!pos) return { closed: false, reason: "no position" };
-  const qty = Math.abs(pos.positionAmt);
-  const side = pos.positionAmt > 0 ? "SELL" : "BUY";
+// Closes the current position with MARKET reduceOnly. Verifies fill via
+// position re-fetch and retries on partial fills (H6). Thin-liquidity windows
+// (Asia/Midnight KZ on low-cap screener picks) or exchange circuit-breakers
+// can leave a residual after a single MARKET; without verification we'd
+// return success while the position is still half-open.
+//
+// Throws on residual >= minQty after maxRetries (default 3). All callers
+// already wrap in try/catch and treat throw as close-failure → operator
+// gets a MANUAL ACTION Telegram and can flatten the rest by hand.
+async function closePositionMarket(symbol, options = {}) {
+  const maxRetries = options.maxRetries ?? 3;
+  let position = (await getOpenPositions(symbol)).find((p) => p.symbol === symbol);
+  if (!position) return { closed: false, reason: "no position" };
+
   const filters = await getSymbolFilters(symbol);
-  const quantity = formatStep(qty, filters.stepSize);
-  const data = await signedRequest("POST", "/fapi/v1/order", {
-    symbol,
-    side,
-    type: "MARKET",
-    quantity,
-    reduceOnly: "true",
-  });
-  return { closed: true, orderId: String(data.orderId), quantity };
+  const side = position.positionAmt > 0 ? "SELL" : "BUY";
+  const originalQty = Math.abs(position.positionAmt);
+
+  const attempts = [];
+  let lastOrderId = null;
+  let totalExecuted = 0;
+
+  for (let i = 0; i < maxRetries; i++) {
+    const remainingNow = position ? Math.abs(position.positionAmt) : 0;
+    if (remainingNow < filters.minQty) break;
+
+    const quantityStr = formatStep(remainingNow, filters.stepSize);
+    if (parseFloat(quantityStr) < filters.minQty) break;
+
+    const data = await signedRequest("POST", "/fapi/v1/order", {
+      symbol, side, type: "MARKET",
+      quantity: quantityStr,
+      reduceOnly: "true",
+    });
+    lastOrderId = String(data.orderId);
+    const execThisAttempt = num(data.executedQty, 0);
+    totalExecuted += execThisAttempt;
+    attempts.push({
+      orderId: lastOrderId,
+      requested: parseFloat(quantityStr),
+      executed: execThisAttempt,
+    });
+
+    // Position re-fetch is source of truth — `executedQty` in the response
+    // can be 0/stale on partial fills; the position endpoint is authoritative.
+    const fresh = await getOpenPositions(symbol);
+    position = fresh.find((p) => p.symbol === symbol);
+    if (!position) break;
+  }
+
+  const remaining = position ? Math.abs(position.positionAmt) : 0;
+
+  // Couldn't even attempt (position smaller than minQty from the start —
+  // shouldn't happen since Binance wouldn't allow it, but defensive).
+  if (attempts.length === 0 && remaining > 0) {
+    const err = new Error(
+      `Cannot close ${symbol}: position ${remaining} below minQty ${filters.minQty}, stuck as dust`,
+    );
+    err.dust = true;
+    err.remaining = remaining;
+    throw err;
+  }
+
+  if (remaining >= filters.minQty) {
+    const err = new Error(
+      `Partial fill on ${symbol}: ${totalExecuted}/${originalQty} closed, ${remaining} remains after ${attempts.length} attempt(s). Last orderId=${lastOrderId}`,
+    );
+    err.partialFill = true;
+    err.executed = totalExecuted;
+    err.remaining = remaining;
+    err.orderId = lastOrderId;
+    err.attempts = attempts;
+    throw err;
+  }
+
+  return {
+    closed: true,
+    orderId: lastOrderId,
+    // Legacy field — total executed across retries, at symbol's precision.
+    quantity: totalExecuted.toFixed(filters.quantityPrecision || 8),
+    requestedQty: originalQty,
+    executedQty: totalExecuted,
+    attempts,
+  };
 }
 
 // ─── Sibling cleanup ────────────────────────────────────────────────────────
@@ -386,10 +504,72 @@ async function cleanupOrphanedOrders(symbol) {
 async function checkFundingRate(symbol) {
   const data = await publicRequest("/fapi/v1/premiumIndex", { symbol });
   return {
-    fundingRate: parseFloat(data.lastFundingRate),
-    nextFundingTime: parseInt(data.nextFundingTime),
-    markPrice: parseFloat(data.markPrice),
+    fundingRate: numRequired(data.lastFundingRate, "fundingRate"),
+    nextFundingTime: parseInt(data.nextFundingTime) || 0,
+    markPrice: numRequired(data.markPrice, "markPrice"),
   };
+}
+
+// ─── Daily limits — exchange source-of-truth ───────────────────────────────
+//
+// REALIZED_PNL income events are the exchange's authoritative ledger of
+// closed-position outcomes. Use this for loss-limit enforcement so it
+// captures fills that happen on the exchange (OCO stop/target) between cron
+// ticks — those never produce a LIVE_CLOSE row in our local CSV, so
+// CSV-based counters miss them entirely.
+//
+// Entry count uses /allOrders filtered to MARKET non-reduceOnly fills. Needs
+// a symbol list (Binance has no cross-symbol allOrders endpoint), so caller
+// passes the active universe (current watchlist).
+
+function todayStartUtcMs() {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+async function getRealizedPnlToday() {
+  const data = await signedRequest("GET", "/fapi/v1/income", {
+    incomeType: "REALIZED_PNL",
+    startTime: todayStartUtcMs(),
+    limit: 1000,
+  });
+  const events = data.map((e) => ({
+    symbol: e.symbol,
+    income: num(e.income, 0),
+    time: parseInt(e.time) || 0,
+    info: e.info,
+  }));
+  const totalPnl = events.reduce((s, e) => s + e.income, 0);
+  const lossCount = events.filter((e) => e.income < 0).length;
+  const winCount = events.filter((e) => e.income > 0).length;
+  return { events, totalPnl, lossCount, winCount };
+}
+
+async function getEntriesPlacedToday(symbols) {
+  if (!Array.isArray(symbols) || symbols.length === 0) return 0;
+  const start = todayStartUtcMs();
+  const counts = await Promise.all(
+    symbols.map(async (symbol) => {
+      try {
+        const orders = await signedRequest("GET", "/fapi/v1/allOrders", {
+          symbol,
+          startTime: start,
+        });
+        return orders.filter(
+          (o) =>
+            o.type === "MARKET" &&
+            o.status === "FILLED" &&
+            o.reduceOnly !== true &&
+            o.reduceOnly !== "true" &&
+            o.closePosition !== true &&
+            o.closePosition !== "true",
+        ).length;
+      } catch {
+        return 0;
+      }
+    }),
+  );
+  return counts.reduce((a, b) => a + b, 0);
 }
 
 // ─── Initialization for one symbol ──────────────────────────────────────────
@@ -417,4 +597,6 @@ export {
   cancelAlgoOrder,
   cleanupOrphanedOrders,
   checkFundingRate,
+  getRealizedPnlToday,
+  getEntriesPlacedToday,
 };

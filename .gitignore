@@ -3,6 +3,7 @@
 safety-check-log.json
 session_buffer.json
 screener_cache.json
+.bot.lock
 node_modules/
 
 # Trade execution logs — contain real order IDs, balances, broker history.

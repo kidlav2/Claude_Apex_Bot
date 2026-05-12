@@ -18,6 +18,31 @@ const config = {
   baseUrl: process.env.BINANCE_BASE_URL || "https://api.binance.com",
 };
 
+// Numeric guards — see binance-futures.js for rationale (NaN poisons downstream
+// comparisons silently). Inlined here to avoid a shared util module.
+function num(x, fallback = null) {
+  const n = typeof x === "number" ? x : parseFloat(x);
+  return Number.isFinite(n) ? n : fallback;
+}
+function numRequired(x, field) {
+  const n = num(x);
+  if (n === null) throw new Error(`Invalid numeric '${field}': ${JSON.stringify(x)}`);
+  return n;
+}
+
+// fetch with timeout — prevents a stuck connection from holding the bot past
+// the next cron tick.
+const FETCH_TIMEOUT_MS = parseInt(process.env.BINANCE_FETCH_TIMEOUT_MS || "10000", 10);
+async function fetchWithTimeout(url, options = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 function sign(query) {
   return crypto.createHmac("sha256", config.secretKey).update(query).digest("hex");
 }
@@ -31,20 +56,37 @@ async function getBalanceUSDT() {
     recvWindow: "5000",
   });
   params.append("signature", sign(params.toString()));
-  const res = await fetch(
-    `${config.baseUrl}/api/v3/account?${params.toString()}`,
-    { headers: { "X-MBX-APIKEY": config.apiKey } },
-  );
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${config.baseUrl}/api/v3/account?${params.toString()}`,
+      { headers: { "X-MBX-APIKEY": config.apiKey } },
+    );
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Spot account fetch timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const data = await res.json();
   if (!res.ok) throw new Error(`Spot account fetch failed: ${data.msg || res.status}`);
   const usdt = data.balances.find((b) => b.asset === "USDT");
-  return usdt ? parseFloat(usdt.free) : 0;
+  if (!usdt) return 0;
+  return numRequired(usdt.free, "spotBalance.free");
 }
 
 // ─── Symbol filters ─────────────────────────────────────────────────────────
 
 async function getSymbolFilters(symbol) {
-  const res = await fetch(`${config.baseUrl}/api/v3/exchangeInfo?symbol=${symbol}`);
+  let res;
+  try {
+    res = await fetchWithTimeout(`${config.baseUrl}/api/v3/exchangeInfo?symbol=${symbol}`);
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Spot exchangeInfo timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const data = await res.json();
   if (!res.ok || !data.symbols?.[0]) {
     throw new Error(`exchangeInfo failed for ${symbol}: ${data.msg || res.status}`);
@@ -54,11 +96,11 @@ async function getSymbolFilters(symbol) {
   const priceFilter = info.filters.find((f) => f.filterType === "PRICE_FILTER");
   const minNotional = info.filters.find((f) => f.filterType === "NOTIONAL" || f.filterType === "MIN_NOTIONAL");
   return {
-    stepSize: parseFloat(lotSize.stepSize),
-    minQty: parseFloat(lotSize.minQty),
-    tickSize: parseFloat(priceFilter.tickSize),
-    minPrice: parseFloat(priceFilter.minPrice),
-    minNotional: minNotional ? parseFloat(minNotional.minNotional || minNotional.notional) : 5,
+    stepSize: numRequired(lotSize.stepSize, "stepSize"),
+    minQty: numRequired(lotSize.minQty, "minQty"),
+    tickSize: numRequired(priceFilter.tickSize, "tickSize"),
+    minPrice: numRequired(priceFilter.minPrice, "minPrice"),
+    minNotional: minNotional ? num(minNotional.minNotional || minNotional.notional, 5) : 5,
   };
 }
 
@@ -80,13 +122,21 @@ async function placeBinanceOrder(symbol, side, sizeUSD) {
     recvWindow: "5000",
   });
   params.append("signature", sign(params.toString()));
-  const res = await fetch(
-    `${config.baseUrl}/api/v3/order?${params.toString()}`,
-    { method: "POST", headers: { "X-MBX-APIKEY": config.apiKey } },
-  );
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${config.baseUrl}/api/v3/order?${params.toString()}`,
+      { method: "POST", headers: { "X-MBX-APIKEY": config.apiKey } },
+    );
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Spot order POST timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const data = await res.json();
   if (!res.ok) throw new Error(`Binance spot order failed: ${data.msg || res.status}`);
-  return { orderId: String(data.orderId), executedQty: parseFloat(data.executedQty || 0), raw: data };
+  return { orderId: String(data.orderId), executedQty: num(data.executedQty, 0), raw: data };
 }
 
 // Atomic OCO bracket — Binance spot supports this natively (one POST returns
@@ -113,10 +163,18 @@ async function placeOcoBracket({ symbol, entrySide, quantity, takeProfit, stopLo
     recvWindow: "5000",
   });
   params.append("signature", sign(params.toString()));
-  const res = await fetch(
-    `${config.baseUrl}/api/v3/order/oco?${params.toString()}`,
-    { method: "POST", headers: { "X-MBX-APIKEY": config.apiKey } },
-  );
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${config.baseUrl}/api/v3/order/oco?${params.toString()}`,
+      { method: "POST", headers: { "X-MBX-APIKEY": config.apiKey } },
+    );
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(`Spot OCO POST timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
   const data = await res.json();
   if (!res.ok) throw new Error(`Spot OCO failed: ${data.msg || res.status}`);
   return { orderListId: String(data.orderListId), params: ocoParams };
@@ -135,6 +193,16 @@ async function moveStopLoss() {
   throw new Error("moveStopLoss not supported on spot — would need OCO replacement");
 }
 
+// Spot has no /income REALIZED_PNL equivalent. A real implementation would
+// walk /api/v3/myTrades per symbol and compute open→close PnL ourselves.
+// Out of scope; spot users fall back to CSV-based counters in bot.js.
+async function getRealizedPnlToday() {
+  return { events: [], totalPnl: 0, lossCount: 0, winCount: 0, unsupported: true };
+}
+async function getEntriesPlacedToday() {
+  return 0;
+}
+
 export {
   placeBinanceOrder,
   placeOcoBracket,
@@ -145,4 +213,6 @@ export {
   getOpenPositions,
   cleanupOrphanedOrders,
   checkFundingRate,
+  getRealizedPnlToday,
+  getEntriesPlacedToday,
 };

@@ -10,10 +10,10 @@
  */
 
 import "dotenv/config";
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, unlinkSync } from "fs";
 import { execSync } from "child_process";
 import { STRATEGY, evaluateEntry, buildRationale, activeKillZone, minutesLeftInKillZone } from "./strategy.js";
-import { getOrBuildWatchlist } from "./screener.js";
+import { getOrBuildWatchlist, revalidateWatchlist } from "./screener.js";
 
 // Broker module is selected by env flag. Both modules export the same surface
 // so processSymbol() doesn't care which is loaded.
@@ -36,6 +36,11 @@ const {
 // Optional: futures-only algo order helpers needed by manageOpenPositions.
 // Spot module doesn't export them — fall back to no-ops.
 const getOpenAlgoOrders = broker.getOpenAlgoOrders || (async () => []);
+// Exchange-backed daily counters (C2). Futures provides real implementations;
+// spot module returns `unsupported: true` / 0 so we fall back to CSV-only.
+const getRealizedPnlToday = broker.getRealizedPnlToday
+  || (async () => ({ events: [], totalPnl: 0, lossCount: 0, winCount: 0, unsupported: true }));
+const getEntriesPlacedToday = broker.getEntriesPlacedToday || (async () => 0);
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -138,6 +143,64 @@ const INSUFFICIENT_MARGIN_RE = /margin is insufficient|insufficient.*balance|ins
 // $0.05 — comfortably above 2× taker fees on USDS-M futures (~0.08%).
 const BE_BUFFER_PCT = 0.001;
 
+// Scaled trailing (M2). Once a position is in profit past 1R, ratchet the SL
+// forward to lock in this fraction of unrealized profit. 0.5 = "lock half of
+// the gain". On a 2R move that's 1R locked; on 3R, 1.5R locked. Trail is
+// monotonic — SL only moves towards mark, never away.
+const TRAIL_PROFIT_FRACTION = parseFloat(process.env.TRAIL_PROFIT_FRACTION || "0.5");
+
+// ─── Process Lock ────────────────────────────────────────────────────────────
+//
+// Prevents overlapping cron runs from racing each other. Cron fires every
+// 5 min, but a run with 7+ symbols and retries can exceed that window.
+// Without a lock, two parallel runs would both read countTodaysTrades() from
+// CSV, see the same count, both pass MAX_TRADES_PER_DAY gate, and double
+// exposure. PID check rejects dead-process locks instantly (covers kill -9,
+// OOM, preempted containers); TTL fallback covers the rare PID-recycle case.
+
+const LOCK_FILE = ".bot.lock";
+const LOCK_TTL_MS = 10 * 60 * 1000; // 10 min — generous vs worst-case run
+
+function acquireLock() {
+  if (existsSync(LOCK_FILE)) {
+    let data = null;
+    try { data = JSON.parse(readFileSync(LOCK_FILE, "utf8")); } catch {}
+    if (data && data.pid && data.timestamp) {
+      const age = Date.now() - data.timestamp;
+      let alive = false;
+      try { process.kill(data.pid, 0); alive = true; } catch {}
+      if (alive && age < LOCK_TTL_MS) {
+        return { ok: false, holder: data.pid, age };
+      }
+      console.log(
+        `🧹 Stale lock from PID ${data.pid} (alive=${alive}, age=${(age / 1000).toFixed(0)}s) — reclaiming`,
+      );
+    }
+    try { unlinkSync(LOCK_FILE); } catch {}
+  }
+  try {
+    writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, timestamp: Date.now() }));
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  return { ok: true };
+}
+
+function releaseLock() {
+  try {
+    if (!existsSync(LOCK_FILE)) return;
+    const data = JSON.parse(readFileSync(LOCK_FILE, "utf8"));
+    if (data.pid === process.pid) unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+// 'exit' fires synchronously before process termination, including after
+// signal handlers call process.exit(). Signals are common on managed infra
+// (GCP/Railway send SIGTERM on preempt/redeploy).
+process.on("exit", releaseLock);
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
+
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 function loadLog() {
@@ -149,16 +212,60 @@ function saveLog(log) {
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
 }
 
-// Counts only executed trades today (mode=PAPER or LIVE in CSV).
-// Blocked/rejected decisions are never counted regardless of orderPlaced flag.
-function countTodaysTrades() {
+// Daily counters — exchange-backed with CSV fallback. (C2.) The exchange
+// is source of truth: REALIZED_PNL events capture OCO stop fills that fire
+// on the exchange between cron ticks and never produce a LIVE_CLOSE row in
+// our CSV. CSV remains as fallback (paper mode, spot mode, exchange outages).
+// Both are cached briefly so we don't hit /fapi/v1/income N times per run.
+
+const MAX_LOSSES_PER_DAY = 3;
+// Equity drawdown circuit-breaker (H12). Stops trading when realized +
+// unrealized PnL for today drops below -X% of the live-synced portfolio.
+// Tunable per env; 5% is a single-bad-day budget — sleep on it, re-enter
+// tomorrow rather than try to "trade back".
+const MAX_DAILY_DD_PCT = parseFloat(process.env.MAX_DAILY_DD_PCT || "5");
+const COUNT_CACHE_TTL_MS = 30 * 1000;
+let _countCache = { value: null, ts: 0 };
+let _lossCache = { value: null, ts: 0 };
+
+function invalidateCounts() {
+  _countCache = { value: null, ts: 0 };
+  _lossCache = { value: null, ts: 0 };
+}
+
+// RFC 4180-ish CSV parser. The Notes column may legitimately contain commas
+// ("Failed: cond A; cond B, slope X"), so naive split(",") shifts every
+// column past Notes by 1+. This parser respects double-quoted fields and the
+// "" escape for embedded quotes.
+function parseCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else { inQuotes = false; }
+      } else cur += c;
+    } else {
+      if (c === ',') { out.push(cur); cur = ""; }
+      else if (c === '"' && cur === "") inQuotes = true;
+      else cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function csvTradeCount() {
   if (!existsSync(CSV_FILE)) return 0;
   const today = new Date().toISOString().slice(0, 10);
   const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
   let count = 0;
   for (const line of lines.slice(1)) {
     if (!line.startsWith(today)) continue;
-    const parts = line.split(",");
+    const parts = parseCsvLine(line);
     if (parts.length < 12) continue;
     const mode = parts[11];
     if (mode === "PAPER" || mode === "LIVE") count++;
@@ -166,34 +273,90 @@ function countTodaysTrades() {
   return count;
 }
 
-// ─── Loss Limit ──────────────────────────────────────────────────────────────
-
-const MAX_LOSSES_PER_DAY = 3;
-
-// Counts closed losing trades today from trades.csv (LIVE_CLOSE rows with uPnL < 0).
-function getTodayLossCount() {
+function csvLossCount() {
   if (!existsSync(CSV_FILE)) return 0;
   const today = new Date().toISOString().slice(0, 10);
   const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
   let count = 0;
   for (const line of lines.slice(1)) {
     if (!line.startsWith(today)) continue;
-    const parts = line.split(",");
+    const parts = parseCsvLine(line);
     if (parts.length < 13) continue;
     if (parts[11] !== "LIVE_CLOSE") continue;
-    const notes = parts.slice(12).join(",").replace(/^"|"$/g, "");
+    const notes = parts[12] || "";
     const match = notes.match(/uPnL=([-\d.]+)/);
     if (match && parseFloat(match[1]) < 0) count++;
   }
   return count;
 }
 
+async function countTodaysTrades(activeSymbols = null) {
+  if (_countCache.value !== null && Date.now() - _countCache.ts < COUNT_CACHE_TTL_MS) {
+    return _countCache.value;
+  }
+  const csv = csvTradeCount();
+  let result = csv;
+  if (USE_FUTURES && !CONFIG.paperTrading && Array.isArray(activeSymbols) && activeSymbols.length > 0) {
+    try {
+      const exchangeCount = await getEntriesPlacedToday(activeSymbols);
+      result = Math.max(csv, exchangeCount);
+    } catch (err) {
+      console.log(`⚠️  Exchange entry-count failed, using CSV (${csv}): ${err.message}`);
+    }
+  }
+  _countCache = { value: result, ts: Date.now() };
+  return result;
+}
+
+async function getTodayLossCount() {
+  if (_lossCache.value !== null && Date.now() - _lossCache.ts < COUNT_CACHE_TTL_MS) {
+    return _lossCache.value;
+  }
+  const csv = csvLossCount();
+  let result = csv;
+  if (USE_FUTURES && !CONFIG.paperTrading) {
+    try {
+      const realized = await getRealizedPnlToday();
+      if (!realized.unsupported) result = Math.max(csv, realized.lossCount);
+    } catch (err) {
+      console.log(`⚠️  Exchange loss-count failed, using CSV (${csv}): ${err.message}`);
+    }
+  }
+  _lossCache = { value: result, ts: Date.now() };
+  return result;
+}
+
+// Total realized + unrealized PnL today, expressed as a fraction of the
+// (live-synced) portfolio. Used by the DD circuit-breaker. Returns null
+// on paper/spot/unsupported so the caller can skip the gate cleanly.
+async function getDailyDrawdownPct() {
+  if (!USE_FUTURES || CONFIG.paperTrading) return null;
+  try {
+    const [realized, positions] = await Promise.all([
+      getRealizedPnlToday(),
+      getOpenPositions(),
+    ]);
+    if (realized.unsupported) return null;
+    const openUnrealized = positions.reduce((s, p) => s + p.unrealizedProfit, 0);
+    const equityDelta = realized.totalPnl + openUnrealized;
+    return {
+      realized: realized.totalPnl,
+      unrealized: openUnrealized,
+      equityDelta,
+      pct: (equityDelta / CONFIG.portfolioValue) * 100,
+    };
+  } catch (err) {
+    console.log(`⚠️  Drawdown check failed: ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Trade Limits ────────────────────────────────────────────────────────────
 
 // Returns { allowed: boolean, reason: string }
-function checkTradeLimits() {
-  const todayCount = countTodaysTrades();
-  const lossCount = getTodayLossCount();
+async function checkTradeLimits(activeSymbols = null) {
+  const todayCount = await countTodaysTrades(activeSymbols);
+  const lossCount = await getTodayLossCount();
 
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
 
@@ -209,6 +372,22 @@ function checkTradeLimits() {
       `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
     );
     return { allowed: false, reason: "TRADE_CAP" };
+  }
+
+  // Daily drawdown circuit-breaker (H12). Fail-open on null (paper, spot,
+  // or exchange query failed) — other limits still apply.
+  const dd = await getDailyDrawdownPct();
+  if (dd !== null) {
+    if (dd.pct <= -MAX_DAILY_DD_PCT) {
+      console.log(
+        `🚫 Daily drawdown limit hit: ${dd.pct.toFixed(2)}% <= -${MAX_DAILY_DD_PCT}% ` +
+          `(realized $${dd.realized.toFixed(2)} + uPnL $${dd.unrealized.toFixed(2)} = $${dd.equityDelta.toFixed(2)})`,
+      );
+      return { allowed: false, reason: "DAILY_DD", dd };
+    }
+    console.log(
+      `✅ Drawdown: ${dd.pct.toFixed(2)}% (realized $${dd.realized.toFixed(2)} + uPnL $${dd.unrealized.toFixed(2)}) — within -${MAX_DAILY_DD_PCT}%`,
+    );
   }
 
   console.log(`✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`);
@@ -571,6 +750,7 @@ function writeTradeCsv(logEntry) {
   }
 
   appendFileSync(CSV_FILE, row + "\n");
+  invalidateCounts();
   console.log(`Tax record saved → ${CSV_FILE}`);
 }
 
@@ -583,7 +763,7 @@ function recentTradeForSymbol(symbol, hours = 4) {
   let latest = null;
   for (const line of lines.slice(1)) {
     if (!/^\d{4}-\d{2}-\d{2},/.test(line)) continue; // skip non-data rows
-    const parts = line.split(",");
+    const parts = parseCsvLine(line);
     if (parts.length < 12) continue;
     const [date, time, , sym, , , , , , , orderId, mode] = parts;
     if (sym !== symbol) continue;
@@ -603,7 +783,7 @@ function generateTaxSummary() {
   }
 
   const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
-  const rows = lines.slice(1).map((l) => l.split(","));
+  const rows = lines.slice(1).map(parseCsvLine);
 
   const live = rows.filter((r) => r[11] === "LIVE");
   const paper = rows.filter((r) => r[11] === "PAPER");
@@ -623,14 +803,71 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
-// ─── Position Management (move-to-BE) ───────────────────────────────────────
-
-// Walk all open futures positions; for each one with floating profit >= 1R,
-// cancel-and-replace the STOP_MARKET algo order at entry price (breakeven).
-// 1R is the original stop distance (entry − current SL for longs).
+// ─── Position Management (move-to-BE + trailing) ───────────────────────────
 //
-// Skipped on spot (atomic OCO replacement is out of scope) and in paper mode.
-// Re-runs are idempotent: once SL == entry the second call just no-ops.
+// Two phases (M2):
+//   Phase 1 (SL still on initial side): trigger when profit >= 1R. Target
+//     SL = max(BE+buffer, entry + TRAIL_PROFIT_FRACTION × profit). On the
+//     normal 1R trigger this resolves to BE+buffer; if cron skipped and we
+//     come in at 2R+, the profit-fraction term wins and we lock in real R.
+//   Phase 2 (SL already past BE): pure ratchet. Target SL = entry +
+//     TRAIL_PROFIT_FRACTION × profit, applied only if it improves on
+//     current SL (move never retraces).
+//
+// Skipped on spot (atomic OCO replacement out of scope) and in paper mode.
+
+async function moveStopWithRecovery(p, exitSide, target, isLong, slPrice, mark, phaseLabel, rMultipleOrLabel) {
+  try {
+    const result = await moveStopLoss(p.symbol, exitSide, target);
+    const lockPct = ((Math.abs(parseFloat(result.newTrigger) - p.entryPrice) / p.entryPrice) * 100);
+    console.log(
+      `  ✅ ${p.symbol}: SL ${phaseLabel} → $${result.newTrigger} ` +
+        `(algo ${result.oldAlgoId} → ${result.newAlgoId}, ${(isLong ? "+" : "-")}${lockPct.toFixed(3)}% from entry)`,
+    );
+    await sendTelegram([
+      `*SL ${phaseLabel === "trailed" ? "Trail" : "Move-to-BE"} — ${p.symbol}* [🔴 LIVE]`,
+      ``,
+      phaseLabel === "trailed"
+        ? `Ratchet — locking in ${(TRAIL_PROFIT_FRACTION * 100).toFixed(0)}% of unrealized profit.`
+        : `Profit reached *1R* — SL moved past entry.`,
+      `*Entry:* $${p.entryPrice}`,
+      `*Old SL:* $${slPrice}`,
+      `*New SL:* $${result.newTrigger}`,
+      `*Mark:* $${mark}${typeof rMultipleOrLabel === "number" ? `  (${rMultipleOrLabel.toFixed(2)}R)` : ""}`,
+    ].join("\n"));
+    return { ok: true };
+  } catch (err) {
+    const naked = /NAKED_POSITION/.test(err.message);
+    console.log(`  ❌ ${p.symbol}: SL move failed — ${err.message}`);
+    if (naked && typeof closePositionMarket === "function") {
+      console.log(`  🚨 ${p.symbol}: NAKED — emergency MARKET close…`);
+      try {
+        const closeRes = await closePositionMarket(p.symbol);
+        await sendTelegram([
+          `🚨 *NAKED POSITION — ${p.symbol}* [🔴 LIVE]`,
+          ``,
+          `SL cancel succeeded but new SL placement failed.`,
+          `*Emergency close:* ✅ order \`${closeRes.orderId}\` (qty ${closeRes.quantity})`,
+        ].join("\n"));
+      } catch (closeErr) {
+        await sendTelegram([
+          `🚨 *MANUAL ACTION — ${p.symbol}* [🔴 LIVE]`,
+          ``,
+          `SL move failed AND emergency close failed.`,
+          `*Error:* \`${closeErr.message}\``,
+          ``,
+          `⚠️  Open Binance and flatten ${p.symbol} immediately.`,
+        ].join("\n"));
+      }
+    } else {
+      await sendTelegram(
+        `⚠️ *SL move failed — ${p.symbol}* [🔴 LIVE]\n\n\`${err.message}\``,
+      );
+    }
+    return { ok: false, error: err.message };
+  }
+}
+
 async function manageOpenPositions() {
   if (!USE_FUTURES || CONFIG.paperTrading) return;
   let positions;
@@ -649,6 +886,14 @@ async function manageOpenPositions() {
     const entry = p.entryPrice;
     const mark = p.markPrice;
 
+    // Underwater positions: nothing to do here. Original SL will catch them;
+    // C3 watchdog covers the no-SL edge case.
+    const inProfit = isLong ? mark > entry : mark < entry;
+    if (!inProfit) {
+      console.log(`  ${p.symbol}: underwater (entry $${entry} mark $${mark}) — no SL adjust`);
+      continue;
+    }
+
     let algoOrders;
     try {
       algoOrders = await getOpenAlgoOrders(p.symbol);
@@ -660,72 +905,158 @@ async function manageOpenPositions() {
       (o) => o.type === "STOP_MARKET" && o.side === exitSide,
     );
     if (!slOrder) {
-      console.log(`  ⚠️  ${p.symbol}: no STOP_MARKET found — skip`);
+      console.log(`  ⚠️  ${p.symbol}: no STOP_MARKET found — skip (C3 watchdog handles)`);
       continue;
     }
     const slPrice = parseFloat(slOrder.triggerPrice || slOrder.stopPrice);
 
-    // Already at/beyond breakeven — nothing to do.
-    if ((isLong && slPrice >= entry) || (!isLong && slPrice <= entry)) {
-      console.log(`  ✓ ${p.symbol}: SL already at BE+ ($${slPrice} vs entry $${entry})`);
+    const profit = isLong ? mark - entry : entry - mark;
+    const beTarget = isLong ? entry * (1 + BE_BUFFER_PCT) : entry * (1 - BE_BUFFER_PCT);
+    const trailTarget = isLong
+      ? entry + profit * TRAIL_PROFIT_FRACTION
+      : entry - profit * TRAIL_PROFIT_FRACTION;
+    const slPastBE = isLong ? slPrice >= entry : slPrice <= entry;
+
+    if (slPastBE) {
+      // Phase 2 — pure ratchet. Only move if trail target improves on the
+      // current SL (closer to mark for the relevant side).
+      const improves = isLong ? trailTarget > slPrice : trailTarget < slPrice;
+      if (!improves) {
+        console.log(
+          `  ✓ ${p.symbol}: SL $${slPrice} ahead of trail $${trailTarget.toFixed(2)}, no move`,
+        );
+        continue;
+      }
+      console.log(
+        `  ${p.symbol}: TRAIL — entry $${entry} mark $${mark} SL $${slPrice} → target $${trailTarget.toFixed(2)}`,
+      );
+      await moveStopWithRecovery(p, exitSide, trailTarget, isLong, slPrice, mark, "trailed");
       continue;
     }
 
+    // Phase 1 — initial SL still active. Need profit ≥ 1R to trigger first move.
     const rDistance = isLong ? entry - slPrice : slPrice - entry;
-    const profit = isLong ? mark - entry : entry - mark;
     const rMultiple = rDistance > 0 ? profit / rDistance : 0;
-    // Lift SL slightly past entry so a flush-back exit covers fees + slippage
-    // and lands at small net plus rather than zero.
-    const beTarget = isLong
-      ? entry * (1 + BE_BUFFER_PCT)
-      : entry * (1 - BE_BUFFER_PCT);
     console.log(
       `  ${p.symbol}: entry $${entry} mark $${mark} SL $${slPrice} → ${rMultiple >= 0 ? "+" : ""}${rMultiple.toFixed(2)}R`,
     );
-    if (profit < rDistance) continue;
+    if (rMultiple < 1) continue;
 
+    // Combined target: better of BE+buffer (fee/wash protection) and the
+    // profit-fraction trail. Normally beTarget wins right at 1R; if we
+    // jumped to 2R+ between ticks, trailTarget wins and locks more profit.
+    const target = isLong ? Math.max(beTarget, trailTarget) : Math.min(beTarget, trailTarget);
+    await moveStopWithRecovery(p, exitSide, target, isLong, slPrice, mark, "moved", rMultiple);
+  }
+}
+
+// ─── Naked-Position Watchdog ────────────────────────────────────────────────
+//
+// Catches positions that have NO active STOP_MARKET algo order — a state
+// possible if a prior bot run died (kill -9, OOM, preempted container)
+// between cancelling the old SL and placing the new one inside moveStopLoss,
+// or between placeBinanceOrder and placeOcoBracket. Without intervention the
+// position would sit unprotected until the next cron tick (up to 5 min in a
+// Kill Zone, hours off-session).
+//
+// Policy: emergency MARKET reduceOnly close + cancel orphaned TP leg +
+// Telegram alert. We don't try to restore an SL because the original SL
+// price isn't persisted on our side (it lived only on the exchange).
+
+async function checkNakedPositions() {
+  if (!USE_FUTURES || CONFIG.paperTrading) return;
+
+  let positions;
+  try {
+    positions = await getOpenPositions();
+  } catch (err) {
+    console.log(`⚠️  Naked-position watchdog: position fetch failed — ${err.message}`);
+    return;
+  }
+  if (positions.length === 0) return;
+
+  console.log(`\n── Naked-Position Watchdog — ${positions.length} open ──────\n`);
+
+  for (const p of positions) {
+    const exitSide = p.positionAmt > 0 ? "SELL" : "BUY";
+    const dir = p.positionAmt > 0 ? "LONG" : "SHORT";
+    const qty = Math.abs(p.positionAmt);
+
+    let algoOrders;
     try {
-      const result = await moveStopLoss(p.symbol, exitSide, beTarget);
-      console.log(
-        `  ✅ ${p.symbol}: SL → BE+${(BE_BUFFER_PCT * 100).toFixed(2)}% (algo ${result.oldAlgoId} → ${result.newAlgoId}, trigger $${result.newTrigger})`,
-      );
-      await sendTelegram([
-        `*Move-to-BE — ${p.symbol}* [🔴 LIVE]`,
-        ``,
-        `Profit reached *1R* — Stop Loss moved past entry by ${(BE_BUFFER_PCT * 100).toFixed(2)}% (covers fees).`,
-        `*Entry:* $${entry}`,
-        `*Old SL:* $${slPrice}`,
-        `*New SL:* $${result.newTrigger}  (BE${isLong ? "+" : "−"}${(BE_BUFFER_PCT * 100).toFixed(2)}%)`,
-        `*Mark:* $${mark}  (${rMultiple.toFixed(2)}R)`,
-      ].join("\n"));
+      algoOrders = await getOpenAlgoOrders(p.symbol);
     } catch (err) {
-      const naked = /NAKED_POSITION/.test(err.message);
-      console.log(`  ❌ ${p.symbol}: SL move failed — ${err.message}`);
-      if (naked && typeof closePositionMarket === "function") {
-        console.log(`  🚨 ${p.symbol}: NAKED — emergency MARKET close…`);
-        try {
-          const closeRes = await closePositionMarket(p.symbol);
-          await sendTelegram([
-            `🚨 *NAKED POSITION — ${p.symbol}* [🔴 LIVE]`,
-            ``,
-            `Move-to-BE cancelled old SL but new SL placement failed.`,
-            `*Emergency close:* ✅ order \`${closeRes.orderId}\` (qty ${closeRes.quantity})`,
-          ].join("\n"));
-        } catch (closeErr) {
-          await sendTelegram([
-            `🚨 *MANUAL ACTION — ${p.symbol}* [🔴 LIVE]`,
-            ``,
-            `Move-to-BE failed AND emergency close failed.`,
-            `*Error:* \`${closeErr.message}\``,
-            ``,
-            `⚠️  Open Binance and flatten ${p.symbol} immediately.`,
-          ].join("\n"));
-        }
-      } else {
-        await sendTelegram(
-          `⚠️ *Move-to-BE failed — ${p.symbol}* [🔴 LIVE]\n\n\`${err.message}\``,
-        );
+      console.log(`  ⚠️  ${p.symbol}: algoOrders fetch failed — ${err.message}, skipping`);
+      continue;
+    }
+    const hasSL = algoOrders.some(
+      (o) => o.type === "STOP_MARKET" && o.side === exitSide,
+    );
+    if (hasSL) {
+      console.log(`  ✓ ${p.symbol}: STOP_MARKET present`);
+      continue;
+    }
+
+    console.log(
+      `  🚨 ${p.symbol}: NO STOP_MARKET — naked ${dir} ${qty} @ $${p.entryPrice}`,
+    );
+
+    let closeRes = null;
+    let closeErr = null;
+    try {
+      closeRes = await closePositionMarket(p.symbol);
+      console.log(
+        `  ✅ ${p.symbol}: emergency close — order ${closeRes.orderId} (qty ${closeRes.quantity})`,
+      );
+    } catch (err) {
+      closeErr = err;
+      console.log(`  ❌ ${p.symbol}: emergency close FAILED — ${err.message}`);
+    }
+
+    // Cancel any orphaned TP leg regardless. If the position was naked because
+    // SL alone failed to place, the TP may still be alive on the exchange.
+    try {
+      const cleanup = await cleanupOrphanedOrders(p.symbol);
+      if (cleanup.cancelled > 0) {
+        console.log(`  🧹 ${p.symbol}: cancelled ${cleanup.cancelled} orphan(s)`);
       }
+    } catch {}
+
+    if (closeRes) {
+      appendCloseRow({
+        symbol: p.symbol,
+        exitSide,
+        qty,
+        markPrice: p.markPrice,
+        unrealizedPnl: p.unrealizedProfit,
+        orderId: closeRes.orderId,
+        reason: "Naked-position watchdog — no STOP_MARKET found, emergency flatten",
+      });
+      await sendTelegram([
+        `🚨 *NAKED POSITION DETECTED — ${p.symbol}* [🔴 LIVE]`,
+        ``,
+        `Position found without STOP_MARKET — likely a crash mid-flight from a prior run (move-to-BE or initial bracket placement).`,
+        ``,
+        `*Direction:* ${dir}`,
+        `*Qty:* ${qty}`,
+        `*Entry:* $${p.entryPrice}`,
+        `*Mark:* $${p.markPrice}`,
+        `*uPnL:* $${p.unrealizedProfit.toFixed(4)}`,
+        ``,
+        `*Emergency close:* ✅ order \`${closeRes.orderId}\``,
+      ].join("\n"));
+    } else {
+      await sendTelegram([
+        `🚨 *MANUAL ACTION REQUIRED — ${p.symbol}* [🔴 LIVE]`,
+        ``,
+        `Naked position detected (no STOP_MARKET) and emergency close FAILED.`,
+        ``,
+        `*Direction:* ${dir} ${qty} @ $${p.entryPrice}`,
+        `*Mark:* $${p.markPrice}`,
+        `*Error:* \`${closeErr.message}\``,
+        ``,
+        `⚠️  Open Binance and flatten ${p.symbol} immediately.`,
+      ].join("\n"));
     }
   }
 }
@@ -734,12 +1065,15 @@ async function manageOpenPositions() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function processSymbol(symbol, timeframe, log) {
+async function processSymbol(symbol, timeframe, log, activeSymbols = null) {
   console.log("\n═══════════════════════════════════════════════════════════");
   console.log(`  ▶ ${symbol} | ${timeframe} | ${USE_FUTURES ? "FUTURES" : "SPOT"}`);
   console.log("═══════════════════════════════════════════════════════════");
 
-  if (countTodaysTrades() >= CONFIG.maxTradesPerDay || getTodayLossCount() >= MAX_LOSSES_PER_DAY) {
+  if (
+    (await countTodaysTrades(activeSymbols)) >= CONFIG.maxTradesPerDay ||
+    (await getTodayLossCount()) >= MAX_LOSSES_PER_DAY
+  ) {
     console.log(`🚫 Daily limit reached — skipping ${symbol}`);
     return;
   }
@@ -877,13 +1211,44 @@ async function processSymbol(symbol, timeframe, log) {
     }
     try {
       const funding = await checkFundingRate(symbol);
-      const skipThreshold = parseFloat(process.env.SKIP_HIGH_FUNDING_RATE || "0.001");
-      const fundingOk = Math.abs(funding.fundingRate) <= skipThreshold;
+      const farThreshold = parseFloat(process.env.SKIP_HIGH_FUNDING_RATE || "0.001");
+      const proximityMin = parseFloat(process.env.SKIP_FUNDING_NEAR_MIN || "15");
+      const nearThreshold = parseFloat(process.env.SKIP_FUNDING_NEAR_RATE || "0.0003");
+      const timeToFundingMin = funding.nextFundingTime > 0
+        ? (funding.nextFundingTime - Date.now()) / 60000
+        : Infinity;
+      // Directional cost at settlement (H4). Positive = WE PAY.
+      //   long + positive rate = pay;   long + negative = receive
+      //   short + positive rate = receive; short + negative = pay
+      // Sign-blind |rate| filter misses the asymmetry: a 0.08% rate is free
+      // money when we're on the receive side, but eats 0.08% of notional if
+      // we hold past settlement on the pay side.
+      const directional = side === "buy" ? funding.fundingRate : -funding.fundingRate;
+      // Far check: existing hard cap on extreme imbalance regardless of timing.
+      const farOk = Math.abs(funding.fundingRate) <= farThreshold;
+      // Near check: only relevant if we'd PAY at the upcoming settlement
+      // within proximityMin minutes. Receiving funding never blocks.
+      const wouldPaySoon = directional > 0 && timeToFundingMin <= proximityMin;
+      const nearOk = !wouldPaySoon || directional <= nearThreshold;
+      const fundingOk = farOk && nearOk;
+
+      let actualDesc;
+      if (!farOk) {
+        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h — extreme imbalance > ${(farThreshold * 100).toFixed(2)}%`;
+      } else if (!nearOk) {
+        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h, settles in ${timeToFundingMin.toFixed(0)}min — directional cost ${(directional * 100).toFixed(4)}% > ${(nearThreshold * 100).toFixed(2)}%`;
+      } else {
+        const dir = directional <= 0
+          ? `we receive ${(Math.abs(directional) * 100).toFixed(4)}%`
+          : `we pay ${(directional * 100).toFixed(4)}%`;
+        const t = Number.isFinite(timeToFundingMin) ? `${timeToFundingMin.toFixed(0)}min` : "?";
+        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h, ${t} to settle, ${dir}`;
+      }
       conditions.push({
         pass: fundingOk,
         label: "Funding rate within tolerance",
-        required: `|funding| <= ${(skipThreshold * 100).toFixed(2)}% per 8h`,
-        actual: `${(funding.fundingRate * 100).toFixed(4)}% per 8h`,
+        required: `|rate| <= ${(farThreshold * 100).toFixed(2)}%; if <${proximityMin}min to settle and we pay, directional <= ${(nearThreshold * 100).toFixed(2)}%`,
+        actual: actualDesc,
       });
     } catch (err) {
       console.log(`⚠️  Funding rate check failed: ${err.message}`);
@@ -954,7 +1319,7 @@ async function processSymbol(symbol, timeframe, log) {
     limits: {
       maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
       maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(),
+      tradesToday: await countTodaysTrades(activeSymbols),
     },
   };
 
@@ -1109,6 +1474,19 @@ async function processSymbol(symbol, timeframe, log) {
 async function run() {
   checkOnboarding();
   initCsv();
+
+  const lock = acquireLock();
+  if (!lock.ok) {
+    if (lock.error) {
+      console.log(`🔒 Could not acquire lock: ${lock.error}`);
+    } else {
+      console.log(
+        `🔒 Another bot run is in progress (PID ${lock.holder}, ${(lock.age / 1000).toFixed(0)}s old) — exit.`,
+      );
+    }
+    return;
+  }
+
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
@@ -1119,6 +1497,11 @@ async function run() {
     `  Trade size: $${CONFIG.maxTradeSizeUSD} | Exposure cap: $${CONFIG.totalExposureLimit}`,
   );
   console.log("═══════════════════════════════════════════════════════════");
+
+  // Naked-position watchdog runs before the Kill Zone check — a position
+  // left without SL by a crashed prior run shouldn't sit unprotected just
+  // because we're between zones. No-op on paper/spot.
+  await checkNakedPositions();
 
   // ── Kill Zone gate ────────────────────────────────────────────────────────
   // With 5-min cron running all day, exit immediately outside active windows.
@@ -1187,6 +1570,53 @@ async function run() {
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Watchlist (${watchlistSource}):\n  ${watchlist.join(", ")}\nTimeframe: ${timeframe}`);
 
+  // Per-tick watchlist revalidation (H7). Even with a warm cache, a mid-zone
+  // pump/dump can push a previously-eligible symbol past max-daily-change or
+  // below the volume floor. One /ticker/24hr batch call here keeps the
+  // watchlist fresh without rebuilding the screener.
+  if (process.env.DYNAMIC_SCREENER !== "false") {
+    try {
+      const reval = await revalidateWatchlist(watchlist);
+      if (reval.dropped.length > 0) {
+        console.log("\n⚠️  Watchlist revalidation — dropped:");
+        for (const d of reval.dropped) {
+          console.log(`   • ${d.symbol} — ${d.reason}`);
+        }
+        watchlist = reval.valid;
+        console.log(`   Active watchlist (${watchlist.length}):\n   ${watchlist.join(", ")}`);
+      } else {
+        console.log("✓ Watchlist revalidation — all symbols still eligible");
+      }
+    } catch (err) {
+      console.log(`⚠️  Watchlist revalidation failed: ${err.message} — proceeding with cached list`);
+    }
+  }
+
+  // Portfolio sync (H13). Trade sizing uses CONFIG.portfolioValue × 50% as
+  // the per-trade cap. If env says $1000 but live balance is $700 (after
+  // drawdown), we'd be over-risking; conversely if balance grew, we'd
+  // auto-compound beyond the user's declared profile. Use min(env, live)
+  // so a drawdown shrinks sizing while profits do NOT auto-compound until
+  // the user raises env explicitly.
+  if (!CONFIG.paperTrading) {
+    try {
+      const liveBalance = await getBalanceUSDT();
+      if (Number.isFinite(liveBalance) && liveBalance > 0) {
+        const envValue = CONFIG.portfolioValue;
+        CONFIG.portfolioValue = Math.min(envValue, liveBalance);
+        if (CONFIG.portfolioValue !== envValue) {
+          console.log(
+            `📊 Portfolio sized to $${CONFIG.portfolioValue.toFixed(2)} (env $${envValue}, live $${liveBalance.toFixed(2)} — using min)`,
+          );
+        } else {
+          console.log(`📊 Portfolio: $${envValue} (live $${liveBalance.toFixed(2)} ≥ env)`);
+        }
+      }
+    } catch (err) {
+      console.log(`⚠️  Portfolio sync failed, using env $${CONFIG.portfolioValue}: ${err.message}`);
+    }
+  }
+
   // Futures-only: idempotent setup of leverage + margin type per symbol.
   // Spot's initSymbol is a no-op so this is safe to call unconditionally.
   if (USE_FUTURES && !CONFIG.paperTrading) {
@@ -1207,13 +1637,15 @@ async function run() {
   await manageOpenPositions();
 
   const log = loadLog();
-  const limits = checkTradeLimits();
+  const limits = await checkTradeLimits(watchlist);
   if (!limits.allowed) {
     const msg = limits.reason === "LOSS_LIMIT"
       ? `🚫 *Loss limit reached* — ${MAX_LOSSES_PER_DAY} losing trades today. Bot stopped for the day.`
       : limits.reason === "TRADE_CAP"
         ? `🚫 *Daily trade cap reached* — ${CONFIG.maxTradesPerDay} trades today. Bot stopped.`
-        : null;
+        : limits.reason === "DAILY_DD"
+          ? `🚫 *Daily drawdown breaker* — equity ${limits.dd.pct.toFixed(2)}% ≤ -${MAX_DAILY_DD_PCT}% (realized $${limits.dd.realized.toFixed(2)} + uPnL $${limits.dd.unrealized.toFixed(2)}). Bot stopped for the day.`
+          : null;
     if (msg) await sendTelegram(msg);
     console.log("\nBot stopping — trade limits reached for today.");
     return;
@@ -1222,7 +1654,7 @@ async function run() {
   for (let i = 0; i < watchlist.length; i++) {
     const symbol = watchlist[i];
     try {
-      await processSymbol(symbol, timeframe, log);
+      await processSymbol(symbol, timeframe, log, watchlist);
     } catch (err) {
       console.error(`❌ ${symbol} failed:`, err.message);
     }
@@ -1249,6 +1681,18 @@ async function run() {
 // Does NOT evaluate strategy or open new positions.
 
 async function closeAllPositions() {
+  const lock = acquireLock();
+  if (!lock.ok) {
+    if (lock.error) {
+      console.log(`🔒 Could not acquire lock: ${lock.error}`);
+    } else {
+      console.log(
+        `🔒 Another bot run is in progress (PID ${lock.holder}, ${(lock.age / 1000).toFixed(0)}s old) — exit.`,
+      );
+    }
+    return;
+  }
+
   console.log("\n═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot — CLOSE-ONLY mode");
   console.log(`  ${new Date().toISOString()}`);
@@ -1263,6 +1707,11 @@ async function closeAllPositions() {
     console.log("📋 PAPER mode — no live positions to close.");
     return;
   }
+
+  // Watchdog runs before the kept-vs-closed loop — emergency-close any naked
+  // position now so the main loop only sees protected positions when deciding
+  // keep-winners-under-OCO vs close.
+  await checkNakedPositions();
 
   let positions;
   try {
@@ -1403,6 +1852,7 @@ function appendCloseRow({ symbol, exitSide, qty, markPrice, unrealizedPnl, order
   ].join(",");
   if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   appendFileSync(CSV_FILE, row + "\n");
+  invalidateCounts();
   console.log(`   Tax record saved → ${CSV_FILE}`);
 }
 
