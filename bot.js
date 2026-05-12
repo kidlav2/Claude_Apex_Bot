@@ -62,6 +62,7 @@ function checkOnboarding() {
         "SYMBOL=BTCUSDT",
         "TIMEFRAME=15m",
         "MIN_MINUTES_LEFT_TO_ENTRY=25",
+        "MAX_HOLD_HOURS=4",
       ].join("\n") + "\n",
     );
     try {
@@ -104,6 +105,13 @@ const CONFIG = {
   leverage: parseInt(process.env.LEVERAGE || "2", 10),
   paperTrading: process.env.PAPER_TRADING !== "false",
   minMinutesLeftToEntry: parseInt(process.env.MIN_MINUTES_LEFT_TO_ENTRY || "25"),
+  // Hard time stop is *conditional* (Variant B): at kill-zone end, profitable
+  // positions are kept open under their existing OCO bracket (TP/SL stay on the
+  // exchange, move-to-BE has already lifted SL once 1R was reached) so the edge
+  // gets a chance to play out past the 60-min window. This is the absolute
+  // backstop — any position older than maxHoldHours is force-closed regardless
+  // of uPnL so a stuck winner can't ride into the next session/overnight.
+  maxHoldHours: parseFloat(process.env.MAX_HOLD_HOURS || "4"),
   binance: {
     apiKey: process.env.BINANCE_API_KEY,
     secretKey: process.env.BINANCE_SECRET_KEY,
@@ -257,7 +265,11 @@ function writeJournalEntry(logEntry, rationale) {
     if (logEntry.oco.paper) {
       ocoLine = `**OCO (paper):** SELL qty=${logEntry.oco.params.quantity} | TP=${logEntry.oco.params.price} | SL stop=${logEntry.oco.params.stopPrice} → limit=${logEntry.oco.params.stopLimitPrice}`;
     } else if (logEntry.oco.placed) {
-      ocoLine = `**OCO:** ✅ list ${logEntry.oco.orderListId}`;
+      // Spot returns a single atomic orderListId; futures returns two algo IDs
+      // (TP_MARKET + STOP_MARKET) since there is no atomic OCO on USDS-M.
+      ocoLine = logEntry.oco.orderListId
+        ? `**OCO:** ✅ list ${logEntry.oco.orderListId}`
+        : `**Bracket:** ✅ TP algo ${logEntry.oco.tpAlgoId} / SL algo ${logEntry.oco.slAlgoId}`;
     } else {
       ocoLine = `**OCO:** ❌ ${logEntry.oco.error || "not placed"}`;
     }
@@ -403,7 +415,11 @@ function buildTelegramReport(logEntry) {
           `*OCO (paper):* qty=${logEntry.oco.params.quantity}, TP=${logEntry.oco.params.price}, SL stop=${logEntry.oco.params.stopPrice}/limit=${logEntry.oco.params.stopLimitPrice}`,
         );
       } else if (logEntry.oco.placed) {
-        lines.push(`*OCO:* ✅ list ${logEntry.oco.orderListId}`);
+        lines.push(
+          logEntry.oco.orderListId
+            ? `*OCO:* ✅ list ${logEntry.oco.orderListId}`
+            : `*Bracket:* ✅ TP algo \`${logEntry.oco.tpAlgoId}\` / SL algo \`${logEntry.oco.slAlgoId}\``,
+        );
       } else {
         lines.push(`*OCO:* ❌ ${logEntry.oco.error || "not placed"}`);
       }
@@ -1233,11 +1249,10 @@ async function run() {
 // Does NOT evaluate strategy or open new positions.
 
 async function closeAllPositions() {
-  const reason = "Hard time stop — kill zone end";
   console.log("\n═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot — CLOSE-ONLY mode");
   console.log(`  ${new Date().toISOString()}`);
-  console.log(`  Reason: ${reason}`);
+  console.log(`  Policy: close losers/flat, keep winners under OCO (max-hold ${CONFIG.maxHoldHours}h)`);
   console.log("═══════════════════════════════════════════════════════════\n");
 
   if (!USE_FUTURES) {
@@ -1266,11 +1281,14 @@ async function closeAllPositions() {
   }
 
   console.log(`Found ${positions.length} open position(s):`);
+  const now = Date.now();
   for (const p of positions) {
     const dir = p.positionAmt > 0 ? "LONG" : "SHORT";
+    const holdH = p.updateTime ? (now - p.updateTime) / 3600000 : null;
     console.log(
       `  ${p.symbol}: ${dir} ${Math.abs(p.positionAmt)} @ $${p.entryPrice} ` +
-        `(mark $${p.markPrice}, uPnL $${p.unrealizedProfit.toFixed(4)})`,
+        `(mark $${p.markPrice}, uPnL $${p.unrealizedProfit.toFixed(4)}, ` +
+        `held ${holdH !== null ? holdH.toFixed(2) + "h" : "n/a"})`,
     );
   }
   console.log();
@@ -1278,6 +1296,31 @@ async function closeAllPositions() {
   const results = [];
   for (const p of positions) {
     const exitSide = p.positionAmt > 0 ? "SELL" : "BUY";
+    const holdH = p.updateTime ? (now - p.updateTime) / 3600000 : null;
+    const overdue = holdH !== null && holdH >= CONFIG.maxHoldHours;
+
+    // Variant B: keep profitable positions running under their existing
+    // OCO bracket so the edge can play out past the 60-min kill zone.
+    // Force-close kicks in only when uPnL <= 0 OR holding time hits the
+    // backstop (CONFIG.maxHoldHours).
+    if (p.unrealizedProfit > 0 && !overdue) {
+      console.log(
+        `🟢 ${p.symbol}: KEEP — uPnL $${p.unrealizedProfit.toFixed(4)} > 0, ` +
+          `held ${holdH !== null ? holdH.toFixed(2) + "h" : "n/a"} < max ${CONFIG.maxHoldHours}h. ` +
+          `Left under OCO bracket.`,
+      );
+      results.push({
+        symbol: p.symbol,
+        kept: true,
+        uPnL: p.unrealizedProfit,
+        holdH,
+      });
+      continue;
+    }
+
+    const reason = overdue
+      ? `Hard time stop — max hold ${CONFIG.maxHoldHours}h exceeded`
+      : `Hard time stop — kill zone end (uPnL <= 0)`;
     try {
       const result = await closePositionMarket(p.symbol);
       console.log(`✅ ${p.symbol} closed — order ${result.orderId} (qty ${result.quantity})`);
@@ -1298,7 +1341,13 @@ async function closeAllPositions() {
         orderId: result.orderId,
         reason,
       });
-      results.push({ symbol: p.symbol, ok: true, orderId: result.orderId, uPnL: p.unrealizedProfit });
+      results.push({
+        symbol: p.symbol,
+        ok: true,
+        orderId: result.orderId,
+        uPnL: p.unrealizedProfit,
+        overdue,
+      });
     } catch (err) {
       console.log(`❌ ${p.symbol} close failed: ${err.message}`);
       appendCloseRow({
@@ -1314,14 +1363,26 @@ async function closeAllPositions() {
     }
   }
 
+  const closed = results.filter((r) => r.ok);
+  const kept = results.filter((r) => r.kept);
+  const failed = results.filter((r) => !r.ok && !r.kept);
   const reportLines = [
     `*Hard Time Stop — Kill Zone End* [🔴 LIVE]`,
     ``,
-    `Closed ${results.filter((r) => r.ok).length}/${results.length} position(s):`,
+    `${closed.length} closed, ${kept.length} kept, ${failed.length} failed (of ${results.length}):`,
   ];
   for (const r of results) {
-    if (r.ok) reportLines.push(`✅ ${r.symbol} — order ${r.orderId} (uPnL $${r.uPnL.toFixed(4)})`);
-    else reportLines.push(`❌ ${r.symbol} — ${r.error}`);
+    if (r.kept) {
+      reportLines.push(
+        `🟢 ${r.symbol} — kept under OCO (uPnL $${r.uPnL.toFixed(4)}, ${r.holdH !== null ? r.holdH.toFixed(2) + "h" : "n/a"} held)`,
+      );
+    } else if (r.ok) {
+      reportLines.push(
+        `✅ ${r.symbol} — closed${r.overdue ? " (max-hold)" : ""}, order ${r.orderId} (uPnL $${r.uPnL.toFixed(4)})`,
+      );
+    } else {
+      reportLines.push(`❌ ${r.symbol} — ${r.error}`);
+    }
   }
   await sendTelegram(reportLines.join("\n"));
   console.log("\n═══════════════════════════════════════════════════════════\n");

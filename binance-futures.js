@@ -130,6 +130,7 @@ async function getOpenPositions(symbol = null) {
       unrealizedProfit: parseFloat(p.unRealizedProfit),
       leverage: parseInt(p.leverage),
       marginType: p.marginType,
+      updateTime: Number(p.updateTime) || 0,
     }));
 }
 
