@@ -143,11 +143,16 @@ const INSUFFICIENT_MARGIN_RE = /margin is insufficient|insufficient.*balance|ins
 // $0.05 — comfortably above 2× taker fees on USDS-M futures (~0.08%).
 const BE_BUFFER_PCT = 0.001;
 
-// Scaled trailing (M2). Once a position is in profit past 1R, ratchet the SL
-// forward to lock in this fraction of unrealized profit. 0.5 = "lock half of
-// the gain". On a 2R move that's 1R locked; on 3R, 1.5R locked. Trail is
-// monotonic — SL only moves towards mark, never away.
+// Scaled trailing (M2). Two-phase design:
+//   Phase 1 — at 1R profit: SL moves to BE+buffer (covers fees, stops wash).
+//   Phase 2 — at TRAIL_TRIGGER_R profit: SL ratchets to lock TRAIL_PROFIT_FRACTION
+//              of the unrealized gain. Monotonic — SL only advances, never retreats.
+//   Example (TRAIL_PROFIT_FRACTION=0.5, TRAIL_TRIGGER_R=1.2):
+//     1.0R hit → SL to BE+buffer
+//     1.2R hit → SL to entry+0.6R (locks 0.6R)
+//     2.0R hit → SL to entry+1.0R (locks 1.0R)
 const TRAIL_PROFIT_FRACTION = parseFloat(process.env.TRAIL_PROFIT_FRACTION || "0.5");
+const TRAIL_TRIGGER_R = parseFloat(process.env.TRAIL_TRIGGER_R || "1.2");
 
 // ─── Process Lock ────────────────────────────────────────────────────────────
 //
@@ -237,24 +242,45 @@ function invalidateCounts() {
 // ("Failed: cond A; cond B, slope X"), so naive split(",") shifts every
 // column past Notes by 1+. This parser respects double-quoted fields and the
 // "" escape for embedded quotes.
+//
+// Defensive rewrite: every branch inside the while-loop has an explicit
+// i-increment so no code path can ever stall the pointer — even on malformed
+// input (unclosed quotes, bare quotes mid-field, empty lines, trailing commas).
 function parseCsvLine(line) {
+  if (typeof line !== "string") return [];
   const out = [];
   let cur = "";
   let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
+  const len = line.length;
+  let i = 0;
+  while (i < len) {
     const c = line[i];
     if (inQuotes) {
       if (c === '"') {
-        if (line[i + 1] === '"') { cur += '"'; i++; }
-        else { inQuotes = false; }
-      } else cur += c;
+        if (i + 1 < len && line[i + 1] === '"') {
+          cur += '"';
+          i += 2; // consume both chars — guaranteed advance of 2
+        } else {
+          inQuotes = false;
+          i += 1; // consume closing quote — guaranteed advance of 1
+        }
+      } else {
+        cur += c;
+        i += 1; // guaranteed advance
+      }
     } else {
-      if (c === ',') { out.push(cur); cur = ""; }
-      else if (c === '"' && cur === "") inQuotes = true;
-      else cur += c;
+      if (c === ',') {
+        out.push(cur);
+        cur = "";
+      } else if (c === '"' && cur === "") {
+        inQuotes = true;
+      } else {
+        cur += c;
+      }
+      i += 1; // guaranteed advance on every non-quote-in-quotes branch
     }
   }
-  out.push(cur);
+  out.push(cur); // trailing field (may be empty for a trailing comma)
   return out;
 }
 
@@ -916,10 +942,23 @@ async function manageOpenPositions() {
       ? entry + profit * TRAIL_PROFIT_FRACTION
       : entry - profit * TRAIL_PROFIT_FRACTION;
     const slPastBE = isLong ? slPrice >= entry : slPrice <= entry;
+    const rDistance = isLong ? entry - slPrice : slPrice - entry;
+    const rMultiple = rDistance > 0 ? profit / rDistance : 0;
+
+    console.log(
+      `  ${p.symbol}: entry $${entry} mark $${mark} SL $${slPrice} → ${rMultiple >= 0 ? "+" : ""}${rMultiple.toFixed(2)}R${slPastBE ? " [BE+]" : ""}`,
+    );
 
     if (slPastBE) {
-      // Phase 2 — pure ratchet. Only move if trail target improves on the
-      // current SL (closer to mark for the relevant side).
+      // Phase 2 — SL is already past BE. Ratchet forward once TRAIL_TRIGGER_R
+      // is reached so early swings (1.0–1.1R) don't over-trail and get stopped
+      // out by normal intra-bar noise before the full target is reached.
+      if (rMultiple < TRAIL_TRIGGER_R) {
+        console.log(
+          `  ✓ ${p.symbol}: SL at BE ($${slPrice}), ${rMultiple.toFixed(2)}R — waiting for ${TRAIL_TRIGGER_R}R to trail`,
+        );
+        continue;
+      }
       const improves = isLong ? trailTarget > slPrice : trailTarget < slPrice;
       if (!improves) {
         console.log(
@@ -928,25 +967,19 @@ async function manageOpenPositions() {
         continue;
       }
       console.log(
-        `  ${p.symbol}: TRAIL — entry $${entry} mark $${mark} SL $${slPrice} → target $${trailTarget.toFixed(2)}`,
+        `  ${p.symbol}: TRAIL — ${rMultiple.toFixed(2)}R — SL $${slPrice} → $${trailTarget.toFixed(2)} (locks ${(TRAIL_PROFIT_FRACTION * 100).toFixed(0)}% of ${profit.toFixed(2)})`,
       );
-      await moveStopWithRecovery(p, exitSide, trailTarget, isLong, slPrice, mark, "trailed");
+      await moveStopWithRecovery(p, exitSide, trailTarget, isLong, slPrice, mark, "trailed", rMultiple);
       continue;
     }
 
-    // Phase 1 — initial SL still active. Need profit ≥ 1R to trigger first move.
-    const rDistance = isLong ? entry - slPrice : slPrice - entry;
-    const rMultiple = rDistance > 0 ? profit / rDistance : 0;
-    console.log(
-      `  ${p.symbol}: entry $${entry} mark $${mark} SL $${slPrice} → ${rMultiple >= 0 ? "+" : ""}${rMultiple.toFixed(2)}R`,
-    );
+    // Phase 1 — SL still on initial side. At 1R, move to BE+buffer only.
+    // The trail ratchet (Phase 2) activates on the next tick once SL clears entry.
     if (rMultiple < 1) continue;
-
-    // Combined target: better of BE+buffer (fee/wash protection) and the
-    // profit-fraction trail. Normally beTarget wins right at 1R; if we
-    // jumped to 2R+ between ticks, trailTarget wins and locks more profit.
-    const target = isLong ? Math.max(beTarget, trailTarget) : Math.min(beTarget, trailTarget);
-    await moveStopWithRecovery(p, exitSide, target, isLong, slPrice, mark, "moved", rMultiple);
+    console.log(
+      `  ${p.symbol}: 1R reached (${rMultiple.toFixed(2)}R) — moving SL to BE $${beTarget.toFixed(2)}`,
+    );
+    await moveStopWithRecovery(p, exitSide, beTarget, isLong, slPrice, mark, "moved", rMultiple);
   }
 }
 
@@ -1211,43 +1244,40 @@ async function processSymbol(symbol, timeframe, log, activeSymbols = null) {
     }
     try {
       const funding = await checkFundingRate(symbol);
+      // Hard cap: block any trade when funding is at extreme imbalance regardless
+      // of settlement timing (signals crowded position — fade risk is high).
       const farThreshold = parseFloat(process.env.SKIP_HIGH_FUNDING_RATE || "0.001");
-      const proximityMin = parseFloat(process.env.SKIP_FUNDING_NEAR_MIN || "15");
-      const nearThreshold = parseFloat(process.env.SKIP_FUNDING_NEAR_RATE || "0.0003");
+      // Proximity gate (H4): if settlement is within `proximityMin` minutes AND
+      // |rate| > `nearThreshold`, skip — the fee would eat into the expected
+      // edge and adverse price action often follows the settlement flush.
+      // Defaults match the spec: 30-minute window, 0.05% absolute threshold.
+      const proximityMin = parseFloat(process.env.SKIP_FUNDING_NEAR_MIN || "30");
+      const nearThreshold = parseFloat(process.env.SKIP_FUNDING_NEAR_RATE || "0.0005");
       const timeToFundingMin = funding.nextFundingTime > 0
         ? (funding.nextFundingTime - Date.now()) / 60000
         : Infinity;
-      // Directional cost at settlement (H4). Positive = WE PAY.
-      //   long + positive rate = pay;   long + negative = receive
-      //   short + positive rate = receive; short + negative = pay
-      // Sign-blind |rate| filter misses the asymmetry: a 0.08% rate is free
-      // money when we're on the receive side, but eats 0.08% of notional if
-      // we hold past settlement on the pay side.
-      const directional = side === "buy" ? funding.fundingRate : -funding.fundingRate;
-      // Far check: existing hard cap on extreme imbalance regardless of timing.
-      const farOk = Math.abs(funding.fundingRate) <= farThreshold;
-      // Near check: only relevant if we'd PAY at the upcoming settlement
-      // within proximityMin minutes. Receiving funding never blocks.
-      const wouldPaySoon = directional > 0 && timeToFundingMin <= proximityMin;
-      const nearOk = !wouldPaySoon || directional <= nearThreshold;
+      const absRate = Math.abs(funding.fundingRate);
+      // Far check: hard cap on extreme imbalance regardless of timing.
+      const farOk = absRate <= farThreshold;
+      // Near check: absolute |rate| — blocks both pay AND receive sides when
+      // settlement is imminent (extreme rates signal crowding; even the receive
+      // side sees a volatility spike at the settlement moment).
+      const nearOk = timeToFundingMin > proximityMin || absRate <= nearThreshold;
       const fundingOk = farOk && nearOk;
 
       let actualDesc;
       if (!farOk) {
-        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h — extreme imbalance > ${(farThreshold * 100).toFixed(2)}%`;
+        actualDesc = `${(absRate * 100).toFixed(4)}%/8h — extreme imbalance > ${(farThreshold * 100).toFixed(2)}%`;
       } else if (!nearOk) {
-        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h, settles in ${timeToFundingMin.toFixed(0)}min — directional cost ${(directional * 100).toFixed(4)}% > ${(nearThreshold * 100).toFixed(2)}%`;
+        actualDesc = `${(absRate * 100).toFixed(4)}%/8h, settles in ${timeToFundingMin.toFixed(0)}min — within ${proximityMin}min window, exceeds ${(nearThreshold * 100).toFixed(3)}% threshold`;
       } else {
-        const dir = directional <= 0
-          ? `we receive ${(Math.abs(directional) * 100).toFixed(4)}%`
-          : `we pay ${(directional * 100).toFixed(4)}%`;
         const t = Number.isFinite(timeToFundingMin) ? `${timeToFundingMin.toFixed(0)}min` : "?";
-        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h, ${t} to settle, ${dir}`;
+        actualDesc = `${(funding.fundingRate * 100).toFixed(4)}%/8h (|${(absRate * 100).toFixed(4)}%|), ${t} to settle — OK`;
       }
       conditions.push({
         pass: fundingOk,
         label: "Funding rate within tolerance",
-        required: `|rate| <= ${(farThreshold * 100).toFixed(2)}%; if <${proximityMin}min to settle and we pay, directional <= ${(nearThreshold * 100).toFixed(2)}%`,
+        required: `|rate| <= ${(farThreshold * 100).toFixed(2)}%; if <${proximityMin}min to settle, |rate| <= ${(nearThreshold * 100).toFixed(3)}%`,
         actual: actualDesc,
       });
     } catch (err) {

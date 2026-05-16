@@ -404,15 +404,19 @@ const STRATEGY = {
 // (via evaluateEntry wrapper) and backtest (which slices historical bars).
 function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClosed = false }) {
   // Live "now" price — used for sizing, distance-to-EMA, SL/TP math, and
-  // logging. The forming bar's close is volatile but it's the best estimate
-  // of the market price right at decision time.
-  const price = ltfCandles[ltfCandles.length - 1].close;
+  // trigger checks. The forming bar's close is volatile but it is the best
+  // estimate of the market price right at decision time.
+  const liveBar = ltfCandles[ltfCandles.length - 1]; // forming bar — full OHLC
+  const price = liveBar.close;
 
   // Closed-only views (H3 fix). The forming bar's OHLC mutates every tick,
   // so a flickering FVG/sweep can pass the gate at xx:14 then disappear at
-  // xx:15 when the candle closes elsewhere. All indicators and pattern
-  // detection use *closed* bars. Only `price` and the bias comparison
-  // (live-price vs closed-EMA) keep the live reference.
+  // xx:15 when the candle closes elsewhere. All *structural* indicators
+  // (EMA, ATR, FVG zones, PDH/PDL, historical sweep) use closed bars.
+  // *Trigger* checks (is price inside a known FVG? is the live bar sweeping
+  // a known level right now?) use liveBar so setups aren't missed because
+  // we waited for the current bar to close — resolves execution lag inside
+  // a 60-minute kill zone without reintroducing lookahead bias.
   const closedLtf = ltfCandles.slice(0, -1);
   const closedHtf = htfCandles.slice(0, -1);
   const closedDaily = dailyCandles.slice(0, -1);
@@ -434,6 +438,31 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
   const fvg = bias ? findRecentFVG(closedLtf, bias, STRATEGY.fvgLookbackBars) : null;
   const sweep = findRecentSweep(closedLtf, bias, pdh, pdl, STRATEGY.sweepLookbackBars);
   const distancePct = htfEma ? Math.abs((price - htfEma) / htfEma) * 100 : null;
+
+  // ── Live trigger checks (no lookahead — zones are closed-bar-derived) ──────
+  //
+  // Live-bar sweep: the current forming bar's wick has already pierced a known
+  // closed-bar PDH/PDL AND the current price has returned inside the level —
+  // equivalent to findRecentSweep's closed-bar logic but evaluated on the live
+  // tick so the signal fires within the bar rather than waiting for its close.
+  const liveSweepActive = Boolean(
+    bias && pdh !== null && pdl !== null && (
+      (bias === "long"  && liveBar.low < pdl && price > pdl) ||
+      (bias === "short" && liveBar.high > pdh && price < pdh)
+    ),
+  );
+
+  // FVG entry trigger: live price is inside (or at the edge of) the FVG zone
+  // identified from closed bars. For a bullish FVG, the entry signal is price
+  // retracing down to the top of the gap (≤ fvg.top). For a bearish FVG,
+  // price retracing up to the bottom of the gap (≥ fvg.bottom). This fires
+  // intra-bar without lookahead because the FVG boundaries are fixed on
+  // already-closed candles.
+  const fvgActive = Boolean(
+    fvg && (
+      fvg.type === "bullish" ? price <= fvg.top : price >= fvg.bottom
+    ),
+  );
 
   const results = [];
   const check = (label, required, actual, pass) => {
@@ -463,10 +492,12 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
   );
 
   check(
-    "Recent FVG aligned with HTF bias",
-    `bullish (long) or bearish (short) within ${STRATEGY.fvgLookbackBars} bars`,
-    fvg ? `${fvg.type} ${fvg.barsAgo} bars ago` : "none",
-    Boolean(fvg),
+    "Recent FVG aligned with HTF bias — live price at zone",
+    `FVG within ${STRATEGY.fvgLookbackBars} closed bars AND live price tapping zone`,
+    fvg
+      ? `${fvg.type} ${fvg.barsAgo} bars ago ($${fvg.bottom.toFixed(2)}–$${fvg.top.toFixed(2)})${fvgActive ? " [ACTIVE ✓]" : " [price outside zone]"}`
+      : "none",
+    fvgActive,
   );
 
   check(
@@ -476,17 +507,20 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
     distancePct !== null && distancePct < STRATEGY.maxDistancePctFromHtfEma,
   );
 
-  const sweepFresh = sweep && sweep.barsAgo <= STRATEGY.maxSweepAgeBars;
+  // Historical closed-bar sweep OR live-bar active sweep — whichever fires first.
+  const sweepFresh = (sweep && sweep.barsAgo <= STRATEGY.maxSweepAgeBars) || liveSweepActive;
   check(
     "Liquidity sweep of PDH/PDL aligned with bias",
     bias === "long"
-      ? `wick below PDL within ${STRATEGY.maxSweepAgeBars} bars`
+      ? `wick below PDL within ${STRATEGY.maxSweepAgeBars} bars (or live bar)`
       : bias === "short"
-        ? `wick above PDH within ${STRATEGY.maxSweepAgeBars} bars`
+        ? `wick above PDH within ${STRATEGY.maxSweepAgeBars} bars (or live bar)`
         : "n/a",
-    sweep
-      ? `${sweep.levelName} swept ${sweep.barsAgo} bars ago at $${sweep.sweepPrice.toFixed(2)}${sweep.barsAgo > STRATEGY.maxSweepAgeBars ? " (STALE)" : ""}`
-      : "none",
+    liveSweepActive
+      ? `live bar sweeping ${bias === "long" ? "PDL" : "PDH"} now (low=$${liveBar.low.toFixed(2)}, price=$${price.toFixed(2)})`
+      : sweep
+        ? `${sweep.levelName} swept ${sweep.barsAgo} bars ago at $${sweep.sweepPrice.toFixed(2)}${sweep.barsAgo > STRATEGY.maxSweepAgeBars ? " (STALE)" : ""}`
+        : "none",
     Boolean(sweepFresh),
   );
 
@@ -599,7 +633,7 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
       htfEma, htfEmaPrev, emaSlope,
       ltfEma, ltfEmaPrev, ltfSlope,
       atr: atrValue,
-      killZone, bias, fvg, sweep, pdh, pdl, distancePct,
+      killZone, bias, fvg, fvgActive, sweep, liveSweepActive, pdh, pdl, distancePct,
       stopDistancePct,
     },
     conditions: results,
