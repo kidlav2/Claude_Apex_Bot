@@ -268,12 +268,43 @@ async function placeBinanceOrder(symbol, side, sizeUSD, options = {}) {
 // Legacy /fapi/v1/order returns -4120 for these types globally — testnet
 // AND prod. The IDs returned here are algoIds, not regular orderIds, and
 // must be cancelled via /fapi/v1/algoOrder DELETE (not /fapi/v1/order).
+// Minimum ticks between a bracket trigger and the current mark price.
+// Prevents placing algo orders so close to the current price that they fire
+// instantly or within one tick — the degenerate case that caused an untracked
+// ENAUSDT position in the May 2026 audit (SL = TP = entry after rounding).
+const MIN_BRACKET_TICKS = parseInt(process.env.MIN_BRACKET_TICKS || "5", 10);
+
 async function placeOcoBracket({ symbol, entrySide, takeProfit, stopLoss }) {
   const filters = await getSymbolFilters(symbol);
   // Exit side is opposite of entry
   const exitSide = entrySide === "buy" ? "SELL" : "BUY";
   const tpTrigger = formatStep(takeProfit, filters.tickSize);
   const slTrigger = formatStep(stopLoss, filters.tickSize);
+
+  // ── Degenerate bracket guard ────────────────────────────────────────────
+  // Fetch current mark price and assert each trigger is at least
+  // MIN_BRACKET_TICKS away. A trigger within 5 ticks of mark will fire the
+  // moment the order lands on the book, closing the position at an
+  // unpredictable price and leaving the sibling leg orphaned.
+  const tickerNow = await publicRequest("/fapi/v1/ticker/price", { symbol });
+  const markNow = numRequired(tickerNow.price, "markPrice");
+  const minDist = MIN_BRACKET_TICKS * filters.tickSize;
+
+  const tpDist = Math.abs(parseFloat(tpTrigger) - markNow);
+  const slDist = Math.abs(parseFloat(slTrigger) - markNow);
+
+  if (tpDist < minDist) {
+    throw new Error(
+      `Degenerate bracket — TP trigger $${tpTrigger} is ${(tpDist / filters.tickSize).toFixed(1)} ticks ` +
+      `from mark $${markNow} (min ${MIN_BRACKET_TICKS} ticks, tickSize ${filters.tickSize})`,
+    );
+  }
+  if (slDist < minDist) {
+    throw new Error(
+      `Degenerate bracket — SL trigger $${slTrigger} is ${(slDist / filters.tickSize).toFixed(1)} ticks ` +
+      `from mark $${markNow} (min ${MIN_BRACKET_TICKS} ticks, tickSize ${filters.tickSize})`,
+    );
+  }
 
   // workingType=MARK_PRICE protects from wick-outs vs LAST_PRICE.
   // priceProtect=true blocks trigger if mark/last spread is abnormal.

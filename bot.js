@@ -204,7 +204,40 @@ function releaseLock() {
 // (GCP/Railway send SIGTERM on preempt/redeploy).
 process.on("exit", releaseLock);
 process.on("SIGINT", () => process.exit(130));
-process.on("SIGTERM", () => process.exit(143));
+
+// SIGTERM — GCP preemption / Cloud Run redeploy. We get ~30 seconds of
+// graceful shutdown time before the runtime escalates to SIGKILL.
+// Use it to send a Telegram alert so the operator knows a session was cut
+// short. A hard 5-second deadline fires regardless, so a Telegram outage
+// or slow network cannot block the shutdown indefinitely.
+process.on("SIGTERM", () => {
+  const kz = activeKillZone();
+  const msg = [
+    `⚠️ *Bot SIGTERM — GCP Preemption Detected*`,
+    ``,
+    `Instance shut down at \`${new Date().toISOString()}\`.`,
+    kz
+      ? `Active Kill Zone: *${kz}* — session may be incomplete.`
+      : `No active Kill Zone at time of signal.`,
+    ``,
+    `Process lock released. CSV and journal state preserved.`,
+  ].join("\n");
+
+  const deadline = setTimeout(() => {
+    console.log("SIGTERM Telegram deadline exceeded — forcing exit.");
+    process.exit(143);
+  }, parseInt(process.env.SIGTERM_ALERT_TIMEOUT_MS || "5000", 10));
+
+  // sendTelegram is a hoisted async function — safe to call here even though
+  // it is declared later in the file. If Telegram is unconfigured it returns
+  // immediately, so the .finally() always fires promptly in that case.
+  sendTelegram(msg)
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(deadline);
+      process.exit(143);
+    });
+});
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 

@@ -27,9 +27,13 @@ const SCREENER = {
   minQuoteVolume24h: parseFloat(process.env.SCREENER_MIN_VOLUME || "75000000"),
   // Daily change cap — protects from chasing the tail of a pump/dump.
   maxAbsPriceChangePct24h: parseFloat(process.env.SCREENER_MAX_DAILY_CHANGE || "12"),
-  // Last-price floor — kicks ultra-cheap meme tokens whose noise dominates
-  // PDH/PDL semantics. 0.01 USDT excludes sub-cent shitcoins.
-  minPrice: parseFloat(process.env.SCREENER_MIN_PRICE || "0.01"),
+  // Last-price floor — rejects micro-priced tokens whose tick-size precision
+  // collapses SL/TP calculations to zero width after formatStep() rounding.
+  // ENAUSDT @ $0.13 (May 2026 audit): passed all strategy gates but produced
+  // SL = TP = entry price — a degenerate bracket that self-triggered instantly.
+  // $1.00 ensures at least two meaningful decimal places for SL/TP arithmetic
+  // on any listed USDT-perpetual. Override with SCREENER_MIN_PRICE in .env.
+  minPrice: parseFloat(process.env.SCREENER_MIN_PRICE || "1.00"),
   // How many high-vol symbols to keep beyond anchors.
   topByVolatility: parseInt(process.env.SCREENER_VOL_TOP || "7", 10),
   // 4h on 15m = 16 bars.

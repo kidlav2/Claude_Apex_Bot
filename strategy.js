@@ -382,9 +382,14 @@ const STRATEGY = {
   ltfEmaPeriod: 20,
   fvgLookbackBars: 20,
   sweepLookbackBars: 192,
-  // Sweep must be fresh — older liquidity grabs lose predictive value.
-  // 15 LTF bars = 3.75h on 15m, well within current Kill Zone influence.
-  maxSweepAgeBars: 15,
+  // Sweep must be recent — older liquidity grabs lose predictive value.
+  // 20 LTF bars = 5h on 15m, covers the current kill zone plus the one before.
+  // Widened from 15 (3.75h) after May 2026 audit: in compression markets with
+  // daily range < 1.5%, PDH/PDL is never breached within a single 60-min
+  // window, so 15 bars produced zero setups across three full days. 20 bars
+  // keeps the gate tight (same-day structure only) while restoring execution
+  // in sideways markets. Tunable via MAX_SWEEP_AGE_BARS without code changes.
+  maxSweepAgeBars: parseInt(process.env.MAX_SWEEP_AGE_BARS || "20", 10),
   // Take-profit multiple of risk. Default 1.5R after empirical review —
   // 100% of historical LIVE trades closed by Hard Time Stop short of a 2R
   // TP, while realized Kill-Zone moves were 0.28–0.70%. Tunable per env
