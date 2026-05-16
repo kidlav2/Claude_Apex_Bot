@@ -398,8 +398,15 @@ const STRATEGY = {
   maxDistancePctFromHtfEma: 1.5,
   atrPeriod: 14,
   atrSlBuffer: 0.5,
-  minStopDistancePct: 0.004,
+  // Min stop distance as fraction of entry. Env override expressed as percent
+  // (MIN_STOP_DISTANCE_PCT=0.25 → 0.0025). Used for A/B tuning the filter
+  // without code edits; default 0.4% preserves prior calibration.
+  minStopDistancePct: parseFloat(process.env.MIN_STOP_DISTANCE_PCT || "0.4") / 100,
   dailyEmaPeriod: 20,
+  // Daily EMA(20) trend filter is high-cost: in 180d backtest it shrank BTC
+  // from +0.27R median configs down to near-zero. DISABLE_DAILY_EMA_FILTER=true
+  // skips the check entirely (it never appears in conditions[], cannot block).
+  disableDailyEmaFilter: process.env.DISABLE_DAILY_EMA_FILTER === "true",
   // HTF structure filter — number of consecutive Lower Highs (longs) /
   // Higher Lows (shorts) that veto a setup against the bias direction.
   htfStructureSwings: 3,
@@ -588,24 +595,27 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
     slopeAligned,
   );
 
-  // Daily EMA(20) trend filter — block counter-trend setups vs daily direction
-  const dailyEmaArr = emaSeries(closedDaily.map((c) => c.close), STRATEGY.dailyEmaPeriod);
-  const dailyEma = dailyEmaArr.length ? dailyEmaArr[dailyEmaArr.length - 1] : null;
-  const dailyEmaPrev = dailyEmaArr.length >= 2 ? dailyEmaArr[dailyEmaArr.length - 2] : null;
-  const dailySlope = dailyEma !== null && dailyEmaPrev !== null ? dailyEma - dailyEmaPrev : null;
-  const dailyTrendOk = dailySlope === null
-    ? false // not enough daily history
-    : bias === "long"
-      ? dailySlope > 0
-      : bias === "short"
-        ? dailySlope < 0
-        : false;
-  check(
-    `Daily EMA(${STRATEGY.dailyEmaPeriod}) trend aligned with bias`,
-    bias === "long" ? "1D EMA rising" : bias === "short" ? "1D EMA falling" : "n/a",
-    dailySlope !== null ? `slope=${dailySlope >= 0 ? "+" : ""}${dailySlope.toFixed(2)}` : "n/a",
-    dailyTrendOk,
-  );
+  // Daily EMA(20) trend filter — block counter-trend setups vs daily direction.
+  // Can be disabled via DISABLE_DAILY_EMA_FILTER=true (A/B test toggle).
+  if (!STRATEGY.disableDailyEmaFilter) {
+    const dailyEmaArr = emaSeries(closedDaily.map((c) => c.close), STRATEGY.dailyEmaPeriod);
+    const dailyEma = dailyEmaArr.length ? dailyEmaArr[dailyEmaArr.length - 1] : null;
+    const dailyEmaPrev = dailyEmaArr.length >= 2 ? dailyEmaArr[dailyEmaArr.length - 2] : null;
+    const dailySlope = dailyEma !== null && dailyEmaPrev !== null ? dailyEma - dailyEmaPrev : null;
+    const dailyTrendOk = dailySlope === null
+      ? false // not enough daily history
+      : bias === "long"
+        ? dailySlope > 0
+        : bias === "short"
+          ? dailySlope < 0
+          : false;
+    check(
+      `Daily EMA(${STRATEGY.dailyEmaPeriod}) trend aligned with bias`,
+      bias === "long" ? "1D EMA rising" : bias === "short" ? "1D EMA falling" : "n/a",
+      dailySlope !== null ? `slope=${dailySlope >= 0 ? "+" : ""}${dailySlope.toFixed(2)}` : "n/a",
+      dailyTrendOk,
+    );
+  }
 
   // LTF EMA(20) slope — intra-session momentum confirmation
   const ltfEmaArr = emaSeries(closedLtf.map((c) => c.close), STRATEGY.ltfEmaPeriod);

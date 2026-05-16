@@ -351,6 +351,45 @@ async function placeOcoBracket({ symbol, entrySide, takeProfit, stopLoss }) {
   };
 }
 
+// Stop-only algo order (no TP sibling). Used by strategies where the take-profit
+// target is dynamic (e.g. mean-reversion to a moving Bollinger middle band) and
+// can't be expressed as a static algo trigger — the bot closes TP via MARKET on
+// detection, but exchange-side SL is still mandatory for crash-safety.
+//
+// Returns the algoId so the caller can cancel it on TP-via-market exit or on
+// position close. Throws if trigger is within MIN_BRACKET_TICKS of mark price.
+async function placeStopOnly({ symbol, exitSide, stopPrice }) {
+  const filters = await getSymbolFilters(symbol);
+  const slTrigger = formatStep(stopPrice, filters.tickSize);
+
+  const tickerNow = await publicRequest("/fapi/v1/ticker/price", { symbol });
+  const markNow = numRequired(tickerNow.price, "markPrice");
+  const minDist = MIN_BRACKET_TICKS * filters.tickSize;
+  const slDist = Math.abs(parseFloat(slTrigger) - markNow);
+  if (slDist < minDist) {
+    throw new Error(
+      `Degenerate stop — trigger $${slTrigger} is ${(slDist / filters.tickSize).toFixed(1)} ticks ` +
+      `from mark $${markNow} (min ${MIN_BRACKET_TICKS} ticks, tickSize ${filters.tickSize})`,
+    );
+  }
+
+  const data = await signedRequest("POST", "/fapi/v1/algoOrder", {
+    algoType: "CONDITIONAL",
+    symbol,
+    side: exitSide,
+    type: "STOP_MARKET",
+    triggerPrice: slTrigger,
+    closePosition: "true",
+    workingType: "MARK_PRICE",
+    priceProtect: "true",
+  });
+
+  return {
+    slAlgoId: String(data.algoId),
+    trigger: parseFloat(slTrigger),
+  };
+}
+
 // ─── Stop-loss management ───────────────────────────────────────────────────
 
 // Cancel the current STOP_MARKET algo order on `symbol` (matched by exitSide)
@@ -669,6 +708,7 @@ async function initSymbol(symbol, leverage = 1, marginType = "ISOLATED") {
 export {
   placeBinanceOrder,
   placeOcoBracket,
+  placeStopOnly,
   moveStopLoss,
   closePositionMarket,
   getBalanceUSDT,

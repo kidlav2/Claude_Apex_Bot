@@ -249,7 +249,11 @@ async function runBacktest({ symbol, timeframe, days, verbose = true }) {
       if (htfIdx < STRATEGY.htfEmaPeriod) continue;
       const htfSlice = htf.slice(Math.max(0, htfIdx - 199), htfIdx + 1);
       const dSlice = dailyBarsBefore(daily, bar.time);
-      if (dSlice.length < 2) continue;
+      // Need ≥1 closed daily bar for PDH/PDL (always). Daily EMA(20) requires
+      // ≥21 daily bars, but only when STRATEGY.disableDailyEmaFilter is false —
+      // gating that case here keeps the loosened-config runs symmetric.
+      if (dSlice.length < 1) continue;
+      if (!STRATEGY.disableDailyEmaFilter && dSlice.length < 2) continue;
 
       const r = evaluateBars({
         ltfCandles: ltfSlice,
@@ -364,9 +368,15 @@ function printSingleSummary(r) {
 // ─── CLI: bulk mode ─────────────────────────────────────────────────────────
 
 async function runBulk() {
-  const SYMBOLS = ["BTCUSDT", "POLUSDT", "LTCUSDT", "ATOMUSDT", "NEARUSDT", "INJUSDT", "APTUSDT"];
+  // Default watchlist mirrors backtest_final_results.md "Final boevoy watchlist"
+  // (7 coins with avgR > 0). Override via BACKTEST_SYMBOLS env (comma-separated).
+  const SYMBOLS = (process.env.BACKTEST_SYMBOLS
+    || "SOLUSDT,POLUSDT,ETHUSDT,ADAUSDT,NEARUSDT,ATOMUSDT,BTCUSDT")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const TFS = ["15m"];
-  const DAYS = 180;
+  const DAYS = parseInt(process.env.BACKTEST_DAYS || "180", 10);
 
   console.log(`\n🔬 Bulk backtest — ${SYMBOLS.length} symbols × ${TFS.length} timeframes × ${DAYS} days\n`);
   const results = [];

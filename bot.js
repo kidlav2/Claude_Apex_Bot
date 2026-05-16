@@ -739,6 +739,12 @@ function clearSessionBuffer() {
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
 
+// All alerts auto-prefixed with the Apex Sniper tag — disambiguates from the
+// sibling "Apex Ranger" mean-reversion bot (mean-bot.js) which posts to the
+// same chat. Tag is the single source of truth — templates stay focused on
+// content, not branding.
+const BOT_TAG = "🎯 *[Apex Sniper]*";
+
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -746,11 +752,12 @@ async function sendTelegram(text) {
     console.log("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID empty) — skipping.");
     return;
   }
+  const tagged = `${BOT_TAG}\n${text}`;
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+      body: JSON.stringify({ chat_id: chatId, text: tagged, parse_mode: "Markdown" }),
     });
     if (!res.ok) {
       const err = await res.text();
