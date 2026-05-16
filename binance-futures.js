@@ -603,6 +603,61 @@ async function getEntriesPlacedToday(symbols) {
   return counts.reduce((a, b) => a + b, 0);
 }
 
+// ─── Limit order execution (pending-limit entry model) ──────────────────────
+//
+// Placed as a regular GTC LIMIT order (not algo). Uses /fapi/v1/order with
+// type=LIMIT so it rests on the book until price retraces to the FVG zone.
+// The bot cancels it via cancelOrder() if the kill zone expires without fill.
+//
+// Note: unlike the market-entry path, no bracket is placed here. The OCO
+// bracket fires in managePendingLimits() after fill detection, using the
+// actual executedQty and avgPrice from the fill event.
+
+async function placeLimitOrder(symbol, side, sizeUSD, limitPrice, options = {}) {
+  const filters = await getSymbolFilters(symbol);
+  if (!(limitPrice > 0)) throw new Error(`Invalid limitPrice: ${limitPrice}`);
+
+  const rawQty = sizeUSD / limitPrice;
+  const quantity = formatStepUp(rawQty, filters.stepSize);
+  const limitFormatted = formatStep(limitPrice, filters.tickSize);
+
+  if (parseFloat(quantity) * parseFloat(limitFormatted) < filters.minNotional) {
+    throw new Error(
+      `Limit notional $${(parseFloat(quantity) * limitPrice).toFixed(2)} < MIN_NOTIONAL $${filters.minNotional}`,
+    );
+  }
+
+  const data = await signedRequest("POST", "/fapi/v1/order", {
+    symbol,
+    side: side.toUpperCase(),
+    type: "LIMIT",
+    timeInForce: "GTC",           // cancelled explicitly at kill-zone end
+    quantity,
+    price: limitFormatted,
+    positionSide: options.positionSide || "BOTH",
+  });
+
+  return {
+    orderId: String(data.orderId),
+    quantity: parseFloat(quantity),
+    limitPrice: parseFloat(limitFormatted),
+    raw: data,
+  };
+}
+
+// Query the status of a regular (non-algo) order. Returns an object with the
+// exchange status string and fill details. Used by managePendingLimits() to
+// detect fills that happened between 5-min cron ticks.
+async function getOrderStatus(symbol, orderId) {
+  const data = await signedRequest("GET", "/fapi/v1/order", { symbol, orderId });
+  return {
+    orderId: String(data.orderId),
+    status: data.status,                              // NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED
+    executedQty: num(data.executedQty, 0),
+    avgPrice: num(data.avgPrice, 0) || num(data.price, 0),
+  };
+}
+
 // ─── Initialization for one symbol ──────────────────────────────────────────
 
 // Idempotent setup: leverage + margin type. Run once per symbol on bot start.
@@ -630,4 +685,6 @@ export {
   checkFundingRate,
   getRealizedPnlToday,
   getEntriesPlacedToday,
+  placeLimitOrder,
+  getOrderStatus,
 };

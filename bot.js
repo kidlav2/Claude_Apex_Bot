@@ -32,10 +32,12 @@ const {
   checkFundingRate,
   closePositionMarket, // futures-only; undefined on spot
   moveStopLoss,        // futures-only on real broker; throws on spot
+  cancelOrder,         // cancels regular (non-algo) orders — used for pending limits
 } = broker;
-// Optional: futures-only algo order helpers needed by manageOpenPositions.
-// Spot module doesn't export them — fall back to no-ops.
+// Optional futures-only helpers — fall back to no-ops on spot.
 const getOpenAlgoOrders = broker.getOpenAlgoOrders || (async () => []);
+const placeLimitOrder  = broker.placeLimitOrder  || null;  // limit entry model
+const getOrderStatus   = broker.getOrderStatus   || null;  // fill detection
 // Exchange-backed daily counters (C2). Futures provides real implementations;
 // spot module returns `unsupported: true` / 0 so we fall back to CSV-only.
 const getRealizedPnlToday = broker.getRealizedPnlToday
@@ -238,6 +240,153 @@ process.on("SIGTERM", () => {
       process.exit(143);
     });
 });
+
+// ─── Pending Limit Orders (limit entry model) ─────────────────────────────────
+//
+// State is persisted across cron ticks in pending_limits.json.
+// Structure: { [symbol]: { orderId, side, limitPrice, quantity, stopLoss,
+//                          takeProfit, killZone, expiresAt, placedAt } }
+//
+// managePendingLimits() runs on every cron tick (even outside a kill zone) so
+// that expired limits from the previous session are always cancelled promptly.
+
+const PENDING_LIMITS_FILE = "pending_limits.json";
+const ENTRY_MODE = process.env.ENTRY_MODE || "limit";
+
+function loadPendingLimits() {
+  if (!existsSync(PENDING_LIMITS_FILE)) return {};
+  try { return JSON.parse(readFileSync(PENDING_LIMITS_FILE, "utf8")); } catch { return {}; }
+}
+
+function savePendingLimit(symbol, data) {
+  const all = loadPendingLimits();
+  all[symbol] = { ...data, symbol };
+  writeFileSync(PENDING_LIMITS_FILE, JSON.stringify(all, null, 2));
+}
+
+function clearPendingLimit(symbol) {
+  const all = loadPendingLimits();
+  delete all[symbol];
+  writeFileSync(PENDING_LIMITS_FILE, JSON.stringify(all, null, 2));
+}
+
+// Appends a row to trades.csv when a pending limit order is confirmed filled.
+function appendLimitFillRow({ symbol, limit, fillPrice, executedQty }) {
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19);
+  const totalUSD = (executedQty * fillPrice).toFixed(2);
+  const fee = (parseFloat(totalUSD) * 0.0005).toFixed(4);
+  const net = (parseFloat(totalUSD) - parseFloat(fee)).toFixed(2);
+  const row = [
+    date, time, "Binance", symbol, limit.side.toUpperCase(),
+    executedQty.toFixed(6), fillPrice.toFixed(4), totalUSD, fee, net,
+    limit.orderId, "LIVE",
+    `"Limit fill — FVG entry @ $${fillPrice} (limit $${limit.limitPrice}) | KZ: ${limit.killZone}"`,
+  ].join(",");
+  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
+  appendFileSync(CSV_FILE, row + "\n");
+  invalidateCounts();
+  console.log(`   Tax record saved → ${CSV_FILE}`);
+}
+
+async function managePendingLimits() {
+  if (ENTRY_MODE !== "limit" || !USE_FUTURES || CONFIG.paperTrading) return;
+  if (!getOrderStatus || !cancelOrder) return;
+
+  const pending = loadPendingLimits();
+  if (Object.keys(pending).length === 0) return;
+
+  console.log(`\n── Pending Limits — ${Object.keys(pending).length} active ───────────────────\n`);
+
+  for (const [symbol, limit] of Object.entries(pending)) {
+    const now = Date.now();
+    const expiresAt = new Date(limit.expiresAt).getTime();
+    const expired = now > expiresAt;
+    const minsRemain = Math.max(0, (expiresAt - now) / 60000).toFixed(0);
+
+    let status;
+    try {
+      status = await getOrderStatus(symbol, limit.orderId);
+    } catch (err) {
+      console.log(`  ⚠️  ${symbol} #${limit.orderId}: status check failed — ${err.message}`);
+      continue;
+    }
+
+    if (status.status === "FILLED") {
+      // Fill confirmed — place OCO bracket and log.
+      const fillPrice = status.avgPrice || limit.limitPrice;
+      console.log(`  ✅ ${symbol}: LIMIT FILLED @ $${fillPrice} (ordered $${limit.limitPrice})`);
+
+      try {
+        const oco = await placeOcoBracket({
+          symbol,
+          entrySide: limit.side,
+          quantity: status.executedQty,
+          takeProfit: limit.takeProfit,
+          stopLoss: limit.stopLoss,
+        });
+        console.log(`  ✅ ${symbol}: bracket — TP algo ${oco.tpAlgoId} / SL algo ${oco.slAlgoId}`);
+        appendLimitFillRow({ symbol, limit, fillPrice, executedQty: status.executedQty });
+
+        await sendTelegram([
+          `✅ *Limit Filled — ${symbol}* [🔴 LIVE]`,
+          ``,
+          `*Side:* ${limit.side.toUpperCase()} | *KZ:* ${limit.killZone}`,
+          `*Fill:* $${fillPrice} (limit was $${limit.limitPrice})`,
+          `*Stop:* $${limit.stopLoss.toFixed(2)} | *Target:* $${limit.takeProfit.toFixed(2)}`,
+          `*Bracket:* ✅ TP algo \`${oco.tpAlgoId}\` / SL algo \`${oco.slAlgoId}\``,
+        ].join("\n"));
+
+      } catch (ocoErr) {
+        console.log(`  ❌ ${symbol}: OCO failed after fill — ${ocoErr.message}`);
+        // Ghost position guard: limit filled but bracket failed.
+        if (typeof closePositionMarket === "function") {
+          try {
+            const closeRes = await closePositionMarket(symbol);
+            await sendTelegram([
+              `🚨 *OCO failed post-fill — ${symbol}* [🔴 LIVE]`,
+              `Emergency close: order \`${closeRes.orderId}\``,
+              `*Error:* \`${ocoErr.message}\``,
+            ].join("\n"));
+          } catch (closeErr) {
+            await sendTelegram([
+              `🚨 *MANUAL ACTION — ${symbol}* [🔴 LIVE]`,
+              `Limit filled, OCO failed, emergency close failed.`,
+              `*OCO error:* \`${ocoErr.message}\``,
+              `*Close error:* \`${closeErr.message}\``,
+              `⚠️ Open Binance and flatten ${symbol} immediately.`,
+            ].join("\n"));
+          }
+        } else {
+          await sendTelegram(`🚨 *OCO failed post-fill — ${symbol}*\n\`${ocoErr.message}\`\nFlatten manually.`);
+        }
+      }
+      clearPendingLimit(symbol);
+
+    } else if (expired || status.status === "CANCELED" || status.status === "REJECTED") {
+      // Kill zone ended without fill, or order was cancelled externally.
+      console.log(`  ⏰ ${symbol}: limit expired/cancelled (${status.status}) — removing`);
+      if (status.status !== "CANCELED" && status.status !== "REJECTED") {
+        try {
+          await cancelOrder(symbol, limit.orderId);
+          console.log(`    Cancellation sent for #${limit.orderId}`);
+        } catch (err) {
+          console.log(`    ⚠️  Cancel failed: ${err.message}`);
+        }
+      }
+      await sendTelegram(
+        `⏰ *Limit Expired — ${symbol}*\n` +
+        `KZ ended without fill @ $${limit.limitPrice}. Order removed.`,
+      );
+      clearPendingLimit(symbol);
+
+    } else {
+      // NEW or PARTIALLY_FILLED — still resting on book.
+      console.log(`  ⏳ ${symbol}: ${status.status} @ $${limit.limitPrice}, ${minsRemain}min remaining`);
+    }
+  }
+}
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -1144,6 +1293,19 @@ async function processSymbol(symbol, timeframe, log, activeSymbols = null) {
     return;
   }
 
+  // Limit mode: if a resting limit already exists for this symbol, skip new
+  // signal evaluation — we're already positioned at the optimal entry point.
+  // managePendingLimits() handles fill detection; this prevents duplicate orders.
+  if (ENTRY_MODE === "limit" && USE_FUTURES && !CONFIG.paperTrading) {
+    const pending = loadPendingLimits();
+    if (pending[symbol]) {
+      console.log(
+        `  ⏳ ${symbol}: limit pending @ $${pending[symbol].limitPrice} — skipping evaluation`,
+      );
+      return;
+    }
+  }
+
   // Futures-only: clean up orphaned SL/TP orders left after a previous fill
   // happened between bot runs. No-op on spot (atomic OCO handles itself).
   if (USE_FUTURES && !CONFIG.paperTrading) {
@@ -1400,22 +1562,75 @@ async function processSymbol(symbol, timeframe, log, activeSymbols = null) {
     console.log(`   Stop: $${stopLoss?.toFixed(2)}  Target: $${takeProfit?.toFixed(2)}`);
 
     if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${actualTradeSize.toFixed(2)} at market`,
-      );
+      const limitInfo = ENTRY_MODE === "limit" && evalResult.pendingLimitPrice
+        ? `LIMIT @ $${evalResult.pendingLimitPrice.toFixed(2)} (FVG ${indicators.fvg?.type})`
+        : `MARKET`;
+      console.log(`\n📋 PAPER TRADE — would ${side} ${symbol} ~$${actualTradeSize.toFixed(2)} ${limitInfo}`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
-      console.log(`   Would OCO: TP=$${takeProfit?.toFixed(2)}, SL=$${stopLoss?.toFixed(2)}`);
+      console.log(`   TP=$${takeProfit?.toFixed(2)}, SL=$${stopLoss?.toFixed(2)}`);
       logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
+      logEntry.orderId = `PAPER-${ENTRY_MODE === "limit" ? "LIMIT" : "MKT"}-${Date.now()}`;
       logEntry.oco = { placed: false, paper: true, takeProfit, stopLoss };
+      if (ENTRY_MODE === "limit") {
+        logEntry.pendingLimit = { limitPrice: evalResult.pendingLimitPrice };
+      }
+
+    } else if (ENTRY_MODE === "limit" && USE_FUTURES && evalResult.pendingLimitPrice && placeLimitOrder) {
+      // ── Limit entry model ────────────────────────────────────────────────────
+      // Place a resting GTC limit at the FVG boundary. The OCO bracket fires
+      // only after fill detection in managePendingLimits() on a subsequent tick.
+      const limitPrice = evalResult.pendingLimitPrice;
+      const minsLeftKz = minutesLeftInKillZone();
+      const kzExpiresAt = new Date(Date.now() + minsLeftKz * 60 * 1000).toISOString();
+
+      console.log(
+        `\n🔵 PLACING LIMIT — ${side?.toUpperCase()} ${symbol} @ $${limitPrice.toFixed(2)} ` +
+        `(FVG ${indicators.fvg?.type} $${indicators.fvg?.bottom.toFixed(2)}–$${indicators.fvg?.top.toFixed(2)})`,
+      );
+      console.log(`   SL=$${stopLoss?.toFixed(2)}  TP=$${takeProfit?.toFixed(2)}  TTL: ${minsLeftKz}min`);
+
+      try {
+        const limitResult = await placeLimitOrder(symbol, side, actualTradeSize, limitPrice);
+        logEntry.orderPlaced = true;
+        logEntry.orderId = limitResult.orderId;
+        logEntry.pendingLimit = { limitPrice, expiresAt: kzExpiresAt };
+
+        savePendingLimit(symbol, {
+          orderId: limitResult.orderId,
+          side,
+          limitPrice,
+          quantity: limitResult.quantity,
+          stopLoss,
+          takeProfit,
+          killZone: indicators.killZone,
+          expiresAt: kzExpiresAt,
+          placedAt: new Date().toISOString(),
+        });
+
+        console.log(`✅ LIMIT PLACED — #${limitResult.orderId} qty=${limitResult.quantity} @ $${limitPrice.toFixed(2)}`);
+        await sendTelegram([
+          `🔵 *Limit Order Placed — ${symbol}* [🔴 LIVE]`,
+          ``,
+          `*Setup:* ${side?.toUpperCase()} | *KZ:* ${indicators.killZone}`,
+          `*FVG:* $${indicators.fvg?.bottom.toFixed(2)}–$${indicators.fvg?.top.toFixed(2)} (${indicators.fvg?.type})`,
+          `*Limit entry:* $${limitPrice.toFixed(2)}`,
+          `*Stop:* $${stopLoss?.toFixed(2)} | *Target:* $${takeProfit?.toFixed(2)}`,
+          `*Expires:* ${kzExpiresAt.slice(11, 16)} UTC (${minsLeftKz}min)`,
+        ].join("\n"));
+
+      } catch (err) {
+        console.log(`❌ LIMIT ORDER FAILED — ${err.message}`);
+        logEntry.error = err.message;
+      }
+
     } else {
+      // ── Market entry model (legacy / spot fallback) ───────────────────────
       console.log(
         `\n🔴 PLACING LIVE ORDER — $${actualTradeSize.toFixed(2)} ${side?.toUpperCase()} ${symbol} (${USE_FUTURES ? "FUTURES" : "SPOT"})`,
       );
       // Retry-on-margin loop: if Binance rejects with "Margin is insufficient"
       // (race between getBalanceUSDT and order: another fill consumed margin,
       // or cross-margin reserved more than expected), shrink by 20% and retry.
-      // Caps the total shrinks across pre-trade + post-rejection at MAX_SHRINK_ATTEMPTS.
       let order = null;
       let lastErr = null;
       while (!order) {
@@ -1565,6 +1780,12 @@ async function run() {
   // left without SL by a crashed prior run shouldn't sit unprotected just
   // because we're between zones. No-op on paper/spot.
   await checkNakedPositions();
+
+  // Pending-limit manager — runs regardless of kill zone state so expired
+  // GTC limits from the prior session are cancelled even between windows.
+  // A fill detected here places the OCO bracket immediately without waiting
+  // for the next signal evaluation tick.
+  await managePendingLimits();
 
   // ── Kill Zone gate ────────────────────────────────────────────────────────
   // With 5-min cron running all day, exit immediately outside active windows.

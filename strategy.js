@@ -403,11 +403,20 @@ const STRATEGY = {
   // HTF structure filter — number of consecutive Lower Highs (longs) /
   // Higher Lows (shorts) that veto a setup against the bias direction.
   htfStructureSwings: 3,
+  // Entry execution model:
+  //   "market" — legacy path: requires live price inside the FVG zone (fvgActive)
+  //              before placing a MARKET order. Low fill rate in impulse markets.
+  //   "limit"  — recommended: places a resting LIMIT at the FVG top/bottom upon
+  //              structural confirmation, waits for price to retrace into the zone.
+  //              Kill-zone TTL acts as expiry. Resolves the 9 000-block fvgActive
+  //              bottleneck without relaxing any structural quality gate.
+  entryMode: process.env.ENTRY_MODE || "limit",
 };
 
 // Pure evaluation — operates on already-fetched bars. Used by both live bot
 // (via evaluateEntry wrapper) and backtest (which slices historical bars).
-function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClosed = false }) {
+// entryMode: "market" | "limit" — controls the FVG gate (see STRATEGY.entryMode).
+function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClosed = false, entryMode = STRATEGY.entryMode }) {
   // Live "now" price — used for sizing, distance-to-EMA, SL/TP math, and
   // trigger checks. The forming bar's close is volatile but it is the best
   // estimate of the market price right at decision time.
@@ -457,17 +466,29 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
     ),
   );
 
-  // FVG entry trigger: live price is inside (or at the edge of) the FVG zone
-  // identified from closed bars. For a bullish FVG, the entry signal is price
-  // retracing down to the top of the gap (≤ fvg.top). For a bearish FVG,
-  // price retracing up to the bottom of the gap (≥ fvg.bottom). This fires
-  // intra-bar without lookahead because the FVG boundaries are fixed on
-  // already-closed candles.
+  // FVG entry trigger — two modes controlled by entryMode:
+  //
+  // MARKET mode ("fvgActive"): live price must already be inside or at the gap
+  //   boundary. Only valid when price retraces during this cron tick. Blocks
+  //   ~9 000 times per 180d when price sweeps and impulses away without returning.
+  //
+  // LIMIT mode ("fvgValid"): FVG must exist on closed bars AND not yet been
+  //   invalidated (price hasn't blown through the far side of the gap). A pending
+  //   LIMIT order is placed at fvg.top/bottom; the exchange handles the fill when
+  //   price retraces. Kill-zone TTL expires the limit if no fill occurs.
+  //
+  // pendingLimitPrice: the exchange price for the resting limit order.
+  //   Bullish FVG → limit BUY at fvg.top  (first retrace touch of the gap)
+  //   Bearish FVG → limit SELL at fvg.bottom
   const fvgActive = Boolean(
-    fvg && (
-      fvg.type === "bullish" ? price <= fvg.top : price >= fvg.bottom
-    ),
+    fvg && (fvg.type === "bullish" ? price <= fvg.top : price >= fvg.bottom),
   );
+  const fvgValid = Boolean(
+    fvg && (fvg.type === "bullish" ? price > fvg.bottom : price < fvg.top),
+  );
+  const pendingLimitPrice = fvg
+    ? (fvg.type === "bullish" ? fvg.top : fvg.bottom)
+    : null;
 
   const results = [];
   const check = (label, required, actual, pass) => {
@@ -496,14 +517,21 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
     Boolean(bias),
   );
 
-  check(
-    "Recent FVG aligned with HTF bias — live price at zone",
-    `FVG within ${STRATEGY.fvgLookbackBars} closed bars AND live price tapping zone`,
-    fvg
-      ? `${fvg.type} ${fvg.barsAgo} bars ago ($${fvg.bottom.toFixed(2)}–$${fvg.top.toFixed(2)})${fvgActive ? " [ACTIVE ✓]" : " [price outside zone]"}`
-      : "none",
-    fvgActive,
-  );
+  // FVG condition: gate depends on entry mode.
+  const fvgConditionPass = entryMode === "limit" ? fvgValid : fvgActive;
+  const fvgLabel = entryMode === "limit"
+    ? "FVG on closed bars — limit entry pending at zone boundary"
+    : "Recent FVG aligned with HTF bias — live price at zone";
+  const fvgRequired = entryMode === "limit"
+    ? `FVG within ${STRATEGY.fvgLookbackBars} bars, not yet invalidated`
+    : `FVG within ${STRATEGY.fvgLookbackBars} bars AND live price tapping zone`;
+  const fvgActual = fvg
+    ? `${fvg.type} ${fvg.barsAgo} bars ago ($${fvg.bottom.toFixed(2)}–$${fvg.top.toFixed(2)})` +
+      (entryMode === "limit"
+        ? (fvgValid ? ` [valid → limit @ $${pendingLimitPrice?.toFixed(2)}]` : " [invalidated]")
+        : (fvgActive ? " [ACTIVE ✓]" : " [price outside zone]"))
+    : "none";
+  check(fvgLabel, fvgRequired, fvgActual, fvgConditionPass);
 
   check(
     `Price within ${STRATEGY.maxDistancePctFromHtfEma}% of HTF EMA (not overextended)`,
@@ -596,50 +624,55 @@ function evaluateBars({ ltfCandles, htfCandles, dailyCandles, killZone, failClos
     ltfSlopeAligned,
   );
 
-  // Pre-compute candidate SL with ATR buffer so we can validate min distance
+  // Pre-compute candidate SL with ATR buffer.
+  // In limit mode the effective entry is pendingLimitPrice (the resting order),
+  // not the current market price. SL/TP and stop-distance are anchored to it so
+  // risk is correctly sized from the moment of fill, not from the current tick.
   const side = bias === "long" ? "buy" : bias === "short" ? "sell" : null;
   let stopLoss = null;
   let takeProfit = null;
   let stopDistancePct = null;
+  const entryRef = (entryMode === "limit" && pendingLimitPrice !== null) ? pendingLimitPrice : price;
   if (fvg && side && atrValue !== null) {
     const buffer = STRATEGY.atrSlBuffer * atrValue;
     stopLoss = side === "buy" ? fvg.bottom - buffer : fvg.top + buffer;
-    stopDistancePct = (Math.abs(price - stopLoss) / price);
+    stopDistancePct = Math.abs(entryRef - stopLoss) / entryRef;
   }
 
-  // Minimum stop distance — block setups where SL is too tight (market noise risk)
+  // Minimum stop distance — block setups where SL is too tight (market noise risk).
   const minOk = stopDistancePct !== null && stopDistancePct >= STRATEGY.minStopDistancePct;
   check(
     "Minimum stop distance from entry",
     `>= ${(STRATEGY.minStopDistancePct * 100).toFixed(2)}%`,
-    stopDistancePct !== null ? `${(stopDistancePct * 100).toFixed(3)}%` : "n/a",
+    stopDistancePct !== null
+      ? `${(stopDistancePct * 100).toFixed(3)}% (from ${entryMode === "limit" ? "limit" : "market"} price $${entryRef.toFixed(2)})`
+      : "n/a",
     minOk,
   );
 
   const allPass = results.every((r) => r.pass);
 
-  // Compute TP only if all conditions passed
+  // Compute TP only when all conditions pass. Both entry modes use entryRef so
+  // the realized RR ratio is consistent regardless of when the fill occurs.
   if (allPass && stopLoss !== null && side) {
-    if (side === "buy") {
-      const risk = price - stopLoss;
-      takeProfit = price + risk * STRATEGY.riskRewardRatio;
-    } else {
-      const risk = stopLoss - price;
-      takeProfit = price - risk * STRATEGY.riskRewardRatio;
-    }
+    const risk = Math.abs(entryRef - stopLoss);
+    takeProfit = side === "buy"
+      ? entryRef + risk * STRATEGY.riskRewardRatio
+      : entryRef - risk * STRATEGY.riskRewardRatio;
   } else {
-    // Reset SL if not passing — avoid stale value in indicators
     if (!allPass) stopLoss = null;
   }
 
   return {
     price,
+    entryMode,
+    pendingLimitPrice: (entryMode === "limit" && allPass) ? pendingLimitPrice : null,
     indicators: {
       htfEma, htfEmaPrev, emaSlope,
       ltfEma, ltfEmaPrev, ltfSlope,
       atr: atrValue,
-      killZone, bias, fvg, fvgActive, sweep, liveSweepActive, pdh, pdl, distancePct,
-      stopDistancePct,
+      killZone, bias, fvg, fvgActive, fvgValid, pendingLimitPrice,
+      sweep, liveSweepActive, pdh, pdl, distancePct, stopDistancePct,
     },
     conditions: results,
     allPass,
