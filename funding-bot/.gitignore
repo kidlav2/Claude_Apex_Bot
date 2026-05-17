@@ -1,0 +1,13 @@
+# Runtime artifacts — generated per-machine, never commit
+state.json
+universe.json
+bot.log
+journal.jsonl
+*.log
+
+# Dependencies
+node_modules/
+
+# Env secrets
+.env
+.env.local

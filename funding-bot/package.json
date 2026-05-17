@@ -1,0 +1,19 @@
+{
+  "name": "funding-bot",
+  "version": "0.1.0",
+  "description": "Funding-rate cash-and-carry arb — paper-trading framework",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "paper": "MODE=paper node index.js",
+    "verify": "node verify.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
