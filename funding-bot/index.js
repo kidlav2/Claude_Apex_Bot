@@ -82,9 +82,20 @@ function gracefulStop(reason) {
 }
 process.on("SIGINT", () => gracefulStop("SIGINT"));
 process.on("SIGTERM", () => gracefulStop("SIGTERM"));
+
+function fatalSync(tag, err) {
+  const stack = (err && err.stack) || String(err);
+  const line = `[${new Date().toISOString()}] [CRITICAL] ${tag}: ${stack}\n`;
+  try { fs.appendFileSync(CONFIG.logFile, line); } catch (_) {}
+  try { console.error(line.trim()); } catch (_) {}
+}
 process.on("uncaughtException", (e) => {
-  log(`UNCAUGHT: ${e.message}\n${e.stack}`);
+  fatalSync("uncaughtException", e);
   gracefulStop("uncaughtException");
+});
+process.on("unhandledRejection", (reason) => {
+  fatalSync("unhandledRejection", reason instanceof Error ? reason : new Error(String(reason)));
+  gracefulStop("unhandledRejection");
 });
 
 // Sleep that aborts when stopping flips true
@@ -153,7 +164,10 @@ async function main() {
   log(`  Entry:       rolling 3-event avg > ${(CONFIG.entryThreshold * 100).toFixed(4)}%/8h`);
   log(`  Exit:        rolling 3-event avg < ${(CONFIG.exitThreshold * 100).toFixed(4)}%/8h`);
   log(`  Spread veto: ${(CONFIG.maxSpreadPct * 100).toFixed(4)}% max on either leg`);
+  log(`  Fees:        spot ${(CONFIG.spotTakerFee*100).toFixed(3)}% taker, futures ${(CONFIG.futuresTakerFee*100).toFixed(3)}% taker, basis ${(CONFIG.basisPenalty*100).toFixed(3)}%`);
+  log(`  Min hold:    ${CONFIG.minHoldCycles} funding cycles before exit eligible`);
   log(`  Universe:    top-${CONFIG.universeSize} by funding stdev (${CONFIG.universeLookbackDays}d lookback, refreshed every ${CONFIG.universeRefreshDays}d)`);
+  log(`  Paths:       state=${CONFIG.stateFile}`);
 
   // Universe
   const universeResult = await loadOrRefreshUniverse(CONFIG, log);
@@ -222,8 +236,10 @@ async function main() {
       }
     }
 
-    // 4. Exit check
+    // 4. Exit check (only after minHoldCycles have accrued — protects
+    //    against round-tripping fees on noise)
     for (const sym of Object.keys(broker.state.openPositions)) {
+      if (!broker.isExitEligible(sym)) continue;
       if (engine.shouldExit(sym)) {
         broker.closePair(sym, "rolling avg < exit threshold");
       }
@@ -272,7 +288,8 @@ async function main() {
   log(`Final summary: equity=$${s.equity.toFixed(2)} net=$${s.net.toFixed(2)} ` +
       `apy=${s.apy.toFixed(2)}% maxDD=${(s.maxDD * 100).toFixed(2)}% ` +
       `trades=${s.closedTrades} fundingGross=$${s.totalFundingGross.toFixed(2)} ` +
-      `fees=$${s.totalFees.toFixed(2)} basis=$${s.totalBasisCost.toFixed(2)}`);
+      `fees=$${s.totalFees.toFixed(2)} (spot $${s.totalFeesSpot.toFixed(2)} + fut $${s.totalFeesFutures.toFixed(2)}) ` +
+      `basis=$${s.totalBasisCost.toFixed(2)}`);
   log("Shutdown complete.");
 }
 

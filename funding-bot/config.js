@@ -3,6 +3,17 @@
  * All tunables via env vars; sane defaults baked in.
  */
 
+import path from "path";
+import { fileURLToPath } from "url";
+
+// Anchor every persisted file to the directory that contains THIS module.
+// Relative paths resolved against process.cwd() created the nested
+// funding-bot/funding-bot/ matryoshka when the bot was launched from
+// inside its own directory. Absolute __dirname paths are immune to cwd.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+export const PROJECT_ROOT = __dirname;
+const rooted = (p) => (path.isAbsolute(p) ? p : path.join(PROJECT_ROOT, p));
+
 export const CONFIG = {
   // Mode: "paper" (simulated execution) or "live" (real Binance API).
   // "live" is intentionally not implemented in MVP — paper first, always.
@@ -14,9 +25,15 @@ export const CONFIG = {
   maxConcurrent:   parseInt(process.env.MAX_CONCURRENT || "5", 10),
 
   // ─── Strategy ────────────────────────────────────────────────────────────
-  entryThreshold: parseFloat(process.env.ENTRY_RATE || "0.00018"),  // 0.018%/8h ≈ 19.7% APR
-  exitThreshold:  parseFloat(process.env.EXIT_RATE  || "0.00008"),  // 0.008%/8h ≈ 8.8% APR
-  rollingWindow:  3,                                                 // 3 events = 24h
+  // Defaults raised after asymmetric-fee fix (spot 0.10% + futures 0.04%).
+  // New round-trip friction ≈ 0.16% of perPairUSD; needs ≥0.025%/8h to clear.
+  entryThreshold: parseFloat(process.env.ENTRY_RATE || "0.00025"),  // 0.025%/8h ≈ 27.4% APR
+  exitThreshold:  parseFloat(process.env.EXIT_RATE  || "0.00012"),  // 0.012%/8h ≈ 13.2% APR
+  rollingWindow:  parseInt(process.env.ROLLING_WINDOW || "3", 10),  // 3 events = 24h
+
+  // Minimum cycles a position must accrue before becoming exit-eligible.
+  // Protects against round-tripping fees on noise (entry → instant exit).
+  minHoldCycles:  parseInt(process.env.MIN_HOLD_CYCLES || "2", 10),
 
   // ─── Universe ────────────────────────────────────────────────────────────
   universeSize:          parseInt(process.env.UNIVERSE_SIZE || "30", 10),
@@ -34,19 +51,29 @@ export const CONFIG = {
   // Stale book = no entry. Reject if book quote older than this many ms.
   maxBookAgeMs:  parseInt(process.env.MAX_BOOK_AGE_MS || "10000", 10),
 
-  // ─── Friction model (must match backtest) ────────────────────────────────
-  makerFee:       0.0002,   // 0.02%
-  basisPenalty:   0.0002,   // 0.02% per round-trip basis dislocation
+  // ─── Friction model (asymmetric: matches real Binance VIP-0 takers) ──────
+  // Cash-and-carry pair = LONG spot (0.10% taker) + SHORT perp (0.04% taker).
+  // Round-trip per pair = 4 trades total (2 entry + 2 exit), each leg paid
+  // at its own fee tier. Round-trip cost ≈ 0.14% of perPairUSD notional.
+  spotTakerFee:    parseFloat(process.env.SPOT_TAKER_FEE    || "0.0010"),
+  futuresTakerFee: parseFloat(process.env.FUTURES_TAKER_FEE || "0.0004"),
+  // Basis dislocation penalty: spot ≠ perp mid at entry/exit. Empirical.
+  basisPenalty:    parseFloat(process.env.BASIS_PENALTY || "0.0002"),
 
   // ─── Polling cadence ─────────────────────────────────────────────────────
   fundingPollMs:  parseInt(process.env.FUNDING_POLL_MS || (5 * 60 * 1000), 10),
   saveStateMs:    parseInt(process.env.SAVE_STATE_MS   || (60 * 1000),     10),
 
-  // ─── Persistence ─────────────────────────────────────────────────────────
-  stateFile:     process.env.STATE_FILE    || "./funding-bot/state.json",
-  universeFile:  process.env.UNIVERSE_FILE || "./funding-bot/universe.json",
-  logFile:       process.env.LOG_FILE      || "./funding-bot/bot.log",
-  journalFile:   process.env.JOURNAL_FILE  || "./funding-bot/journal.jsonl",
+  // ─── WebSocket resilience ────────────────────────────────────────────────
+  wsReconnectBaseMs:  parseInt(process.env.WS_RECONNECT_BASE_MS  || "1000",  10),
+  wsReconnectMaxMs:   parseInt(process.env.WS_RECONNECT_MAX_MS   || "30000", 10),
+  wsMaxReconnects:    parseInt(process.env.WS_MAX_RECONNECTS     || "20",    10),
+
+  // ─── Persistence (absolute paths anchored to module dir) ─────────────────
+  stateFile:     rooted(process.env.STATE_FILE    || "state.json"),
+  universeFile:  rooted(process.env.UNIVERSE_FILE || "universe.json"),
+  logFile:       rooted(process.env.LOG_FILE      || "bot.log"),
+  journalFile:   rooted(process.env.JOURNAL_FILE  || "journal.jsonl"),
 
   // ─── Binance endpoints ───────────────────────────────────────────────────
   futuresBase: "https://fapi.binance.com",

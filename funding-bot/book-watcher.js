@@ -1,17 +1,20 @@
 /**
  * L1 BookTicker WebSocket watcher with auto-reconnect, stale detection,
- * and dynamic symbol subscription.
+ * bounded exponential backoff, and explicit crash-on-overflow semantics.
  *
  * Why L1 only: bookTicker stream is ~10x lighter than diffDepth (best
  * bid/ask only). Single-vCPU can handle 30-50 symbols comfortably.
  *
- * Memory footprint: 1 Map entry per symbol, ~80 bytes. 30 syms ≈ 3 KB.
- *
- * Acts as a VETO gate before entry: if spread > maxSpreadPct of mid, or
- * if last quote is older than maxBookAgeMs, the entry is blocked.
+ * Resilience contract:
+ *   - Every WS error/close logged with reason
+ *   - Reconnect backoff: base * 2^attempt with jitter, capped at wsReconnectMaxMs
+ *   - After wsMaxReconnects consecutive failures, write [CRITICAL] line
+ *     SYNCHRONOUSLY to bot.log and exit(1) — never a silent death
+ *   - stop() is idempotent and safe in any readyState
  */
 
 import WebSocket from "ws";
+import fs from "fs";
 
 export class BookWatcher {
   constructor(symbols, config, log) {
@@ -20,19 +23,20 @@ export class BookWatcher {
     this.book = new Map(); // SYMBOL -> { bid, ask, bidQty, askQty, t }
     this.symbols = new Set(symbols.map((s) => s.toUpperCase()));
     this.ws = null;
-    this.reconnectMs = 1000;
-    this.maxReconnectMs = 30000;
+    this.stopped = false;
+    this.reconnectAttempt = 0;
+    this.consecutiveFailures = 0;
     this.lastMsgT = Date.now();
     this.staleTimer = null;
-    this.msgCounter = 0; // for throughput stats
+    this.msgCounter = 0;
     this.msgRateMonitor = null;
+    this.pendingReconnect = null;
   }
 
   start() {
+    this.stopped = false;
     this._connect();
-    // Watchdog: force reconnect if no messages for 60s
     this.staleTimer = setInterval(() => this._checkStale(), 30000);
-    // Throughput log: every 5 min print msgs/sec
     this.msgRateMonitor = setInterval(() => {
       const rate = (this.msgCounter / 300).toFixed(1);
       this.log(`BookWatcher throughput: ${rate} msg/sec over last 5min`);
@@ -41,21 +45,28 @@ export class BookWatcher {
   }
 
   stop() {
-    if (this.staleTimer) clearInterval(this.staleTimer);
-    if (this.msgRateMonitor) clearInterval(this.msgRateMonitor);
-    if (this.ws) {
-      this.ws.removeAllListeners();
-      // ws.close() throws if WebSocket is in CONNECTING state (readyState 0).
-      // Use terminate() which is safe in any state.
-      try {
-        if (this.ws.readyState === 1 /* OPEN */) {
-          this.ws.close();
-        } else {
-          this.ws.terminate();
-        }
-      } catch (e) { /* swallow */ }
-      this.ws = null;
-    }
+    this.stopped = true;
+    if (this.staleTimer) { clearInterval(this.staleTimer); this.staleTimer = null; }
+    if (this.msgRateMonitor) { clearInterval(this.msgRateMonitor); this.msgRateMonitor = null; }
+    if (this.pendingReconnect) { clearTimeout(this.pendingReconnect); this.pendingReconnect = null; }
+    this._teardownSocket();
+  }
+
+  /** Tear down current socket safely from ANY readyState (incl. CONNECTING). */
+  _teardownSocket() {
+    if (!this.ws) return;
+    const ws = this.ws;
+    this.ws = null;
+    try { ws.removeAllListeners(); } catch (_) {}
+    // Attach a noop error handler so any in-flight error after close()
+    // never escapes as unhandled.
+    try { ws.on("error", () => {}); } catch (_) {}
+    try {
+      // terminate() forcibly closes from any state including CONNECTING.
+      // close() throws "WebSocket was closed before the connection was
+      // established" if called pre-OPEN — that was the original crash.
+      ws.terminate();
+    } catch (_) { /* swallow */ }
   }
 
   /** Update the watched symbols set; reconnects with new streams. */
@@ -66,25 +77,41 @@ export class BookWatcher {
     if (added.length === 0 && removed.length === 0) return;
     this.log(`BookWatcher: symbol set changed (+${added.length} -${removed.length}), reconnecting`);
     this.symbols = newSet;
-    if (this.ws) this.ws.close(); // close handler will reconnect with new streams
+    // Reset backoff because this is an intentional cycle, not a failure
+    this.reconnectAttempt = 0;
+    this.consecutiveFailures = 0;
+    this._teardownSocket();
+    this._scheduleReconnect(100);
   }
 
   _connect() {
+    if (this.stopped) return;
     if (this.symbols.size === 0) {
       this.log("BookWatcher: no symbols, skipping connect");
       return;
     }
-    const streams = [...this.symbols].map((s) => `${s.toLowerCase()}@bookTicker`).join("/");
-    const url = `${this.config.wsBase}/stream?streams=${streams}`;
-    this.ws = new WebSocket(url);
 
-    this.ws.on("open", () => {
+    let ws;
+    try {
+      const streams = [...this.symbols].map((s) => `${s.toLowerCase()}@bookTicker`).join("/");
+      const url = `${this.config.wsBase}/stream?streams=${streams}`;
+      ws = new WebSocket(url);
+    } catch (e) {
+      this.log(`BookWatcher: WS constructor threw: ${e.message}`);
+      this._onFailure(`constructor: ${e.message}`);
+      return;
+    }
+
+    this.ws = ws;
+
+    ws.on("open", () => {
       this.log(`BookWatcher: WS connected (${this.symbols.size} symbols)`);
-      this.reconnectMs = 1000;
+      this.reconnectAttempt = 0;
+      this.consecutiveFailures = 0;
       this.lastMsgT = Date.now();
     });
 
-    this.ws.on("message", (raw) => {
+    ws.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw);
         const d = msg.data || msg;
@@ -100,28 +127,72 @@ export class BookWatcher {
         });
         this.lastMsgT = Date.now();
         this.msgCounter += 1;
-      } catch (e) {
-        // ignore parse failures
+      } catch (_) { /* ignore parse failures */ }
+    });
+
+    ws.on("error", (err) => {
+      const msg = (err && err.message) || String(err);
+      this.log(`BookWatcher: WS error: ${msg}`);
+      // Do NOT teardown here — 'close' always fires after 'error' on ws.
+    });
+
+    ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString() : "";
+      if (this.stopped) {
+        this.log(`BookWatcher: WS closed during shutdown (code=${code})`);
+        return;
       }
-    });
-
-    this.ws.on("close", () => {
-      this.log(`BookWatcher: WS closed; reconnect in ${this.reconnectMs}ms`);
-      setTimeout(() => this._connect(), this.reconnectMs);
-      this.reconnectMs = Math.min(this.reconnectMs * 2, this.maxReconnectMs);
-    });
-
-    this.ws.on("error", (err) => {
-      this.log(`BookWatcher: WS error: ${err.message || err}`);
-      // close handler will fire and reconnect
+      this._onFailure(`close code=${code}${reason ? ` reason=${reason}` : ""}`);
     });
   }
 
+  _onFailure(reason) {
+    this.consecutiveFailures += 1;
+    if (this.consecutiveFailures >= this.config.wsMaxReconnects) {
+      // CRITICAL: write synchronously so the line lands on disk before exit
+      const line = `[${new Date().toISOString()}] [CRITICAL] BookWatcher: max WS reconnection attempts ` +
+                   `(${this.config.wsMaxReconnects}) reached. Last reason: ${reason}. Exiting process.\n`;
+      try { fs.appendFileSync(this.config.logFile, line); } catch (_) {}
+      try { console.error(line.trim()); } catch (_) {}
+      this._teardownSocket();
+      // Hard exit — bypass async shutdown so we never get stuck on an
+      // unresolved promise while the operator stares at a vanished PID.
+      process.exit(1);
+    }
+
+    const delay = this._backoffDelay();
+    this.log(`BookWatcher: WS down (${reason}); reconnect attempt ` +
+             `${this.consecutiveFailures}/${this.config.wsMaxReconnects} in ${delay}ms`);
+    this._teardownSocket();
+    this._scheduleReconnect(delay);
+  }
+
+  _backoffDelay() {
+    const base = this.config.wsReconnectBaseMs;
+    const cap  = this.config.wsReconnectMaxMs;
+    const exp  = Math.min(cap, base * Math.pow(2, this.reconnectAttempt));
+    this.reconnectAttempt += 1;
+    // Decorrelated jitter: pick uniformly in [base, exp * 1.5] capped at cap
+    const jittered = base + Math.random() * (Math.min(cap, exp * 1.5) - base);
+    return Math.max(base, Math.floor(jittered));
+  }
+
+  _scheduleReconnect(delayMs) {
+    if (this.stopped) return;
+    if (this.pendingReconnect) clearTimeout(this.pendingReconnect);
+    this.pendingReconnect = setTimeout(() => {
+      this.pendingReconnect = null;
+      this._connect();
+    }, delayMs);
+  }
+
   _checkStale() {
+    if (this.stopped) return;
     const age = Date.now() - this.lastMsgT;
     if (age > 60000 && this.ws) {
       this.log(`BookWatcher: stale (${Math.floor(age / 1000)}s); forcing reconnect`);
-      this.ws.close();
+      // Treat staleness as failure — counts toward backoff/limit.
+      this._onFailure(`stale ${Math.floor(age / 1000)}s`);
     }
   }
 
@@ -135,10 +206,6 @@ export class BookWatcher {
 
   /**
    * Spread veto gate. Returns { pass: bool, reason?, spread? }.
-   * Pass criteria:
-   *   - Have a book quote
-   *   - Quote younger than maxBookAgeMs
-   *   - Spread (ask-bid)/mid <= maxSpreadPct
    */
   passesSpreadGate(symbol) {
     const snap = this.snapshot(symbol);
