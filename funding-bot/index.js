@@ -27,6 +27,7 @@ import { loadOrRefreshUniverse } from "./universe.js";
 import { BookWatcher } from "./book-watcher.js";
 import { FundingEngine } from "./funding-engine.js";
 import { PaperBroker } from "./paper-broker.js";
+import { sendTelegram, sendTelegramWithTimeout } from "./telegram.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -88,6 +89,11 @@ function fatalSync(tag, err) {
   const line = `[${new Date().toISOString()}] [CRITICAL] ${tag}: ${stack}\n`;
   try { fs.appendFileSync(CONFIG.logFile, line); } catch (_) {}
   try { console.error(line.trim()); } catch (_) {}
+  // Best-effort TG notification. Fire-and-forget here; main shutdown path
+  // continues asynchronously. The watcher has its own awaitable TG send
+  // on its CRITICAL exit path — this covers everything else.
+  const short = (err && err.message) || String(err);
+  sendTelegram(`⚠️ *[CRITICAL]* Бот останавливает работу.\nПричина: \`${tag}: ${short}\``).catch(() => {});
 }
 process.on("uncaughtException", (e) => {
   fatalSync("uncaughtException", e);
@@ -184,13 +190,21 @@ async function main() {
   log(`Engine: primed ${primed.success}/${symbols.length} (failed ${primed.failed})`);
   if (stopping) { log("Stopped during engine prime."); return; }
 
-  // Book watcher
-  const watcher = new BookWatcher(symbols, CONFIG, log);
+  // Book watcher — awaitable TG on CRITICAL exit so message lands before exit(1)
+  const watcher = new BookWatcher(symbols, CONFIG, log, sendTelegramWithTimeout);
   watcher.start();
 
-  // Paper broker
-  const broker = new PaperBroker(CONFIG, log);
+  // Paper broker — fire-and-forget TG on OPEN/CLOSE (must not block trading)
+  const broker = new PaperBroker(CONFIG, log, sendTelegram);
   await broker.loadState();
+
+  // Startup notification — fires once universe + state are ready.
+  sendTelegram(
+    `🚀 Бот запущен в режиме *${CONFIG.mode.toUpperCase()}*.\n` +
+    `Баланс: \`$${broker.equity().toFixed(2)}\`. Универс сформирован (${symbols.length} символов).\n` +
+    `Per pair: $${CONFIG.perPairUSD} × max ${CONFIG.maxConcurrent} concurrent. ` +
+    `Entry > ${(CONFIG.entryThreshold*100).toFixed(4)}%/8h, exit < ${(CONFIG.exitThreshold*100).toFixed(4)}%/8h.`
+  ).catch(() => {});
 
   // Let WS settle so we have some book quotes before first cycle
   log(`Warmup: waiting 5s for book quotes...`);

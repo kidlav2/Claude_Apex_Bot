@@ -17,9 +17,12 @@ import WebSocket from "ws";
 import fs from "fs";
 
 export class BookWatcher {
-  constructor(symbols, config, log) {
+  constructor(symbols, config, log, telegramCritical) {
     this.config = config;
     this.log = log;
+    // Awaitable Telegram sender used ONLY on the critical exit path.
+    // Must resolve (not reject) within a bounded time; see telegram.js.
+    this.telegramCritical = telegramCritical || (() => Promise.resolve());
     this.book = new Map(); // SYMBOL -> { bid, ask, bidQty, askQty, t }
     this.symbols = new Set(symbols.map((s) => s.toUpperCase()));
     this.ws = null;
@@ -149,22 +152,32 @@ export class BookWatcher {
   _onFailure(reason) {
     this.consecutiveFailures += 1;
     if (this.consecutiveFailures >= this.config.wsMaxReconnects) {
-      // CRITICAL: write synchronously so the line lands on disk before exit
-      const line = `[${new Date().toISOString()}] [CRITICAL] BookWatcher: max WS reconnection attempts ` +
-                   `(${this.config.wsMaxReconnects}) reached. Last reason: ${reason}. Exiting process.\n`;
-      try { fs.appendFileSync(this.config.logFile, line); } catch (_) {}
-      try { console.error(line.trim()); } catch (_) {}
-      this._teardownSocket();
-      // Hard exit — bypass async shutdown so we never get stuck on an
-      // unresolved promise while the operator stares at a vanished PID.
-      process.exit(1);
+      this._criticalExit(reason);
+      return;
     }
-
     const delay = this._backoffDelay();
     this.log(`BookWatcher: WS down (${reason}); reconnect attempt ` +
              `${this.consecutiveFailures}/${this.config.wsMaxReconnects} in ${delay}ms`);
     this._teardownSocket();
     this._scheduleReconnect(delay);
+  }
+
+  _criticalExit(reason) {
+    // CRITICAL: log synchronously so the line lands on disk before exit
+    const line = `[${new Date().toISOString()}] [CRITICAL] BookWatcher: max WS reconnection attempts ` +
+                 `(${this.config.wsMaxReconnects}) reached. Last reason: ${reason}. Exiting process.\n`;
+    try { fs.appendFileSync(this.config.logFile, line); } catch (_) {}
+    try { console.error(line.trim()); } catch (_) {}
+    this._teardownSocket();
+    // Best-effort Telegram notification, capped so we never hang on exit.
+    // The TG function itself enforces its own timeout; the outer race here
+    // is belt-and-suspenders in case the Promise never settles.
+    const tgMsg = `⚠️ *[CRITICAL]* Бот останавливает работу.\n` +
+                  `Причина: \`${reason}\`\n` +
+                  `Достигнут лимит реконнектов сокета (${this.config.wsMaxReconnects}).`;
+    const tgP = this.telegramCritical(tgMsg).catch(() => {});
+    const hardCap = new Promise((r) => setTimeout(r, 3500));
+    Promise.race([tgP, hardCap]).then(() => process.exit(1));
   }
 
   _backoffDelay() {

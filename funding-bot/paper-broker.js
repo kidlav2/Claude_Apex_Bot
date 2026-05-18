@@ -30,9 +30,11 @@ function legFees(perLeg, cfg) {
 }
 
 export class PaperBroker {
-  constructor(config, log) {
+  constructor(config, log, telegram) {
     this.config = config;
     this.log = log;
+    // Optional fire-and-forget Telegram sender. If omitted, broker stays silent.
+    this.telegram = telegram || (() => Promise.resolve());
     this.state = this._freshState();
   }
 
@@ -151,6 +153,12 @@ export class PaperBroker {
     this.log(`[OPEN]  ${symbol.padEnd(14)} mid=$${midPrice}  rollAvg=${(rollingAvg*100).toFixed(4)}%/8h  ` +
              `fees=$${fees.total.toFixed(4)} (spot $${fees.spot.toFixed(4)} + fut $${fees.futures.toFixed(4)})  ` +
              `cash=$${this.state.cashBalance.toFixed(2)}`);
+    this.telegram(
+      `🔴 *OPEN POSITION* — \`${symbol}\` 🔴\n` +
+      `Объем: $${cfg.perPairUSD} ($${perLeg} Spot / $${perLeg} Futures)\n` +
+      `Цена входа (Mid): \`${midPrice}\`\n` +
+      `Текущий фандинг (${cfg.rollingWindow}-cycle avg): \`${(rollingAvg*100).toFixed(4)}%/8h\``
+    ).catch(() => {});
   }
 
   closePair(symbol, reason, time = Date.now()) {
@@ -190,6 +198,15 @@ export class PaperBroker {
              `gross=$${pos.totalFunding.toFixed(4)} ` +
              `fees=$${(entryFeesTotal + fees.total).toFixed(4)} ` +
              `basis=$${basisCost.toFixed(4)} net=$${netPnL.toFixed(4)}`);
+    const sign = netPnL >= 0 ? "+" : "";
+    const eqNow = this.equity();
+    this.telegram(
+      `🟢 *CLOSE POSITION* — \`${symbol}\` 🟢\n` +
+      `Причина: ${reason}\n` +
+      `Удержано циклов: ${pos.cycles} | Время в рынке: ${trade.durationDays.toFixed(2)} дней\n` +
+      `Чистый PnL (с учетом комиссий): \`${sign}$${netPnL.toFixed(4)}\` USDT\n` +
+      `Текущий баланс: \`$${eqNow.toFixed(2)}\` USDT`
+    ).catch(() => {});
     return trade;
   }
 
